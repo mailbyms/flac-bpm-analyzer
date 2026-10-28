@@ -786,6 +786,9 @@ impl FlacBpmApp {
                 ui.label(RichText::new("播放模式").size(12.5).color(TEXT_SUB));
                 let mode = match self.audio.mode() {
                     PlaybackMode::Real => "真实音频输出（cpal / WASAPI）",
+                    PlaybackMode::Simulated if !crate::audio::playback_available() => {
+                        "本构建未编译音频输出（playback feature 关闭），仅模拟走时"
+                    }
                     PlaybackMode::Simulated => "模拟走时（未找到可用音频设备）",
                 };
                 ui.label(RichText::new(mode).size(13.0).color(TEXT));

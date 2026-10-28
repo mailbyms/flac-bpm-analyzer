@@ -9,11 +9,23 @@ rust-version = "1.88"
 resolver = "3"
 description = "音频节拍分析器：导入单个 FLAC / MP3，自动估计 BPM，展示波形与节拍"
 
+[features]
+# 默认 = 桌面版（界面 + 播放）。
+default = ["gui", "playback"]
+
+# 图形界面：eframe/egui + 文件对话框（rfd）。
+# 关掉后只剩命令行分析，二进制不含窗口代码，终端/服务器上可跑。
+gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
+
+# 音频输出：rodio → cpal。Linux 下 cpal 走 alsa-sys，需要 alsa 开发包（见 README）。
+# 关掉后播放退化为「模拟走时」，不链接任何 C 库。
+playback = ["dep:rodio"]
+
 [dependencies]
 # ---------- GUI ----------
-eframe = "0.32"        # egui 桌面壳层
-egui = "0.32"          # 与 eframe 内置版本保持一致
-egui_extras = "0.32"   # 少量额外组件 / 图片加载支持
+eframe = { version = "0.32", optional = true }      # egui 桌面壳层
+egui = { version = "0.32", optional = true }        # 与 eframe 内置版本保持一致
+egui_extras = { version = "0.32", optional = true } # 少量额外组件 / 图片加载支持
 
 # ---------- 解码 ----------
 # 只启用 flac + mp3，避免把 ogg/vorbis/aac 等无关编解码器拉进来
@@ -21,10 +33,10 @@ symphonia = { version = "0.5", default-features = false, features = ["flac", "mp
 
 # ---------- 播放 ----------
 # 只启用 playback（cpal 输出），我们自行喂 SamplesBuffer，不需要 rodio 自带的解码器
-rodio = { version = "0.23", default-features = false, features = ["playback"] }
+rodio = { version = "0.23", default-features = false, features = ["playback"], optional = true }
 
 # ---------- 文件对话框 ----------
-rfd = "0.17"
+rfd = { version = "0.17", optional = true }
 
 [profile.release]
 opt-level = 3

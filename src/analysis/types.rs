@@ -35,6 +35,8 @@ pub struct AnalysisResult {
     /// 用于绘制波形的归一化峰值数组（0.0 ~ 1.0，长度固定）
     pub waveform_peaks: Vec<f32>,
     /// 每小节拍数（当前固定 4/4）
+    // 只被 CSV 导出（gui feature）读取；纯命令行构建里没人用，别为它报警告
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub beats_per_bar: i32,
 }
 
@@ -45,6 +47,8 @@ pub enum AnalysisEvent {
     /// 分析完成：结果 + 用于播放的原始交错 PCM（共享所有权，零拷贝交给音频引擎）
     Finished {
         result: Box<AnalysisResult>,
+        // 只有播放链路会消费 PCM；关掉 playback 后命令行分析不需要它
+        #[cfg_attr(not(feature = "playback"), allow(dead_code))]
         pcm: std::sync::Arc<Vec<f32>>,
     },
     /// 失败原因

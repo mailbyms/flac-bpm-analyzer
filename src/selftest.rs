@@ -63,9 +63,15 @@ fn synth_click_track(bpm: f32, seconds: f32, sr: u32, first_beat: f32, seed: u64
 
 /// 命令行单文件分析：`cargo run --release -- --analyze <file.flac|file.mp3>`
 /// 用于在不启动界面的情况下验证「解码 + DSP」全链路是否正常。
-pub fn analyze_file(path: &std::path::Path) {
+///
+/// 返回 `Some(())` 表示分析成功，`None` 表示解码/分析失败（调用方据此设置退出码）。
+pub fn analyze_file(path: &std::path::Path) -> Option<crate::analysis::types::AnalysisResult> {
     use crate::analysis::{start_analysis, types::AnalysisEvent};
+    use std::io::IsTerminal;
     use std::time::Duration;
+
+    // 输出被重定向/管道时不刷进度（`\r` 在文件里会变成一长串），只留结果行
+    let interactive = std::io::stdout().is_terminal();
 
     println!("分析文件：{}", path.display());
     let mut handle = start_analysis(path.to_path_buf());
@@ -79,7 +85,9 @@ pub fn analyze_file(path: &std::path::Path) {
         for evt in events {
             match evt {
                 AnalysisEvent::Progress { value, label } => {
-                    print!("\r{label} {:.0}%   ", value * 100.0);
+                    if interactive {
+                        print!("\r{label} {:.0}%   ", value * 100.0);
+                    }
                 }
                 AnalysisEvent::Finished { result, pcm: _ } => {
                     println!(
@@ -107,11 +115,11 @@ pub fn analyze_file(path: &std::path::Path) {
                                 .join(" / ")
                         );
                     }
-                    return;
+                    return Some(*result);
                 }
                 AnalysisEvent::Failed(e) => {
                     println!("\n失败：{e}");
-                    return;
+                    return None;
                 }
             }
         }
@@ -186,6 +194,7 @@ pub fn run() -> bool {
 ///
 /// 判定依据：rodio 的 `get_pos()` 统计的是被输出设备**实际消费**的采样数，
 /// 只有真的在出声才会推进；若它不动，说明 source 根本没被播放（例如被 pause 卡住）。
+#[cfg(feature = "playback")]
 pub fn playtest(path: &std::path::Path) {
     use crate::analysis::{start_analysis, types::AnalysisEvent};
     use crate::audio::{AudioEngine, PlaybackMode};

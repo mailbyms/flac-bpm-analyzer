@@ -4,8 +4,9 @@ Windows 桌面 GUI 工具：导入单个 **FLAC 或 MP3** 文件 → 自动分�
 纯 Rust 实现，UI 使用 egui/eframe，解码使用 symphonia，播放使用 rodio（cpal）。
 
 - 支持格式：`.flac`（无损）、`.mp3`（有损，常见 32–320 kbps / 44.1–48 kHz）
-- 单次只分析一个文件，导入新文件即替换当前结果；不支持批量队列
+- 单次只分析一个文件，导入新文件即替换当前结果；不支持批量队列（批量请用命令行版或 `tools/` 里的脚本）
 - 节拍结果为只读展示，不提供人工校正
+- 可只编「命令行分析」部分在终端 / 服务器运行，见[终端 / 无界面版](#终端--无界面版服务器ci容器)
 
 ## 下载（免编译）
 
@@ -100,6 +101,50 @@ cargo update <name>@<当前版本> --precise <兼容版本>
 # 例：cargo update -p uuid --precise 1.26.1
 ```
 
+## 终端 / 无界面版（服务器、CI、容器）
+
+界面与音频输出是两个独立 feature，可以只编出「分析」这部分，服务器上不需要 ALSA、不需要显示器：
+
+```bash
+# 纯命令行：无窗口、无音频、不链接任何 C 库
+cargo build --release --no-default-features
+
+# 命令行 + 播放（还想跑 --playtest 时；Linux 仍需 alsa 开发包）
+cargo build --release --no-default-features --features playback
+
+# 桌面版（默认）
+cargo build --release
+```
+
+产物都在 `target/release/flac-bpm-analyzer`（Windows 为 `.exe`），体积差一个数量级：
+
+| 构建 | features | Windows release 体积 | 能力 |
+| --- | --- | --- | --- |
+| 桌面版 | 默认（`gui` + `playback`） | 6.5 MB | 波形界面 + 播放 |
+| 命令行 + 播放 | `--no-default-features --features playback` | 1.5 MB | 终端分析 + `--playtest` |
+| 纯命令行 | `--no-default-features` | 1.0 MB | 只做分析，零系统库依赖 |
+
+用法与行为：
+
+```bash
+flac-bpm-analyzer --analyze song.flac             # 单个文件
+flac-bpm-analyzer --analyze a.flac b.mp3 c.flac   # 多个文件，末尾打印汇总表
+flac-bpm-analyzer --selftest                      # DSP 自检（合成鼓点，不需要音频文件）
+flac-bpm-analyzer -h                              # 完整用法
+```
+
+- 输出被管道/重定向时**不刷进度条**，只留结果行，方便 `grep` / `awk`
+- 退出码：`0` 成功 / `1` 分析或自检失败 / `2` 参数错误，可直接串进脚本的 `set -e`
+- `--help` 最后一行会打印当前构建包含的能力（如 `无界面 + 无音频输出`），排查时先看这行
+- 单曲耗时（release）：175 秒的 FLAC 约 0.3 秒，比界面版少掉整条 GUI 初始化
+
+想要真正能到处拷的静态二进制（连 glibc 都不依赖）：
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+```
+
 ## 批量核对标签 BPM
 
 `tools/check_bpm_vs_tags.sh` 拿一个目录，把每个 `.flac` 的**标签 BPM**（metaflac 读取）
@@ -135,7 +180,7 @@ tools/check_bpm_vs_tags.sh "D:/Music" -t 0.5         # 收紧「一致」容差�
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/main.rs` | 入口：eframe 启动、中文字体注册、全局样式、命令行模式分发 |
+| `src/main.rs` | 入口：命令行分发（`--analyze` / `--selftest` / `--playtest`）+ 界面启动（仅 `gui` feature） |
 | `src/app.rs` | egui 界面与状态机（Empty / Loading / Analyzing / Ready / Error）、快捷键、拖放 |
 | `src/theme.rs` | 所有颜色与尺寸常量（设计稿色值集中在此） |
 | `src/ui/waveform.rs` | 波形舞台：工具栏、时间刻度、分层绘制（波形 → 节拍 → 播放头 → 悬浮提示）、横向滚动条、播放控制 |
@@ -143,9 +188,9 @@ tools/check_bpm_vs_tags.sh "D:/Music" -t 0.5         # 收紧「一致」容差�
 | `src/analysis/decode.rs` | symphonia 解码：元数据读取、混音、原始 PCM 保留（播放用）、进度上报 |
 | `src/analysis/dsp.rs` | DSP：降采样、能量包络、onset 检测、自相关测速、相位对齐、节拍生成、置信度 |
 | `src/analysis/types.rs` | 数据结构（`AnalysisResult`、`AnalysisEvent`、`FileMeta` 等） |
-| `src/audio.rs` | 播放控制（真实输出 / 无设备时降级为模拟走时） |
-| `src/export.rs` | 节拍表 CSV 导出（UTF-8 BOM，Excel 可直接打开） |
-| `src/selftest.rs` | 自检与命令行分析模式（开发/验证用） |
+| `src/audio.rs` | 播放控制（真实输出；无设备或未编 `playback` 时降级为模拟走时） |
+| `src/export.rs` | 节拍表 CSV 导出（UTF-8 BOM，Excel 可直接打开；随 `gui` 一起编译） |
+| `src/selftest.rs` | 自检与命令行分析（`--selftest` / `--analyze` / `--playtest`，后两者不依赖界面） |
 | `build.rs` | 构建脚本：调 Windows SDK 的 `rc.exe` 把 `.ico` 嵌进 exe（找不到则只告警、不中断） |
 | `assets/icon.ico` | 应用图标多尺寸（16/24/32/48/64/128 BMP + 256 PNG） |
 | `assets/icon_256.rgba` | 窗口/任务栏图标，原始 RGBA，运行时 `include_bytes!` 直接用（免解码依赖） |
@@ -188,12 +233,15 @@ python tools/check_icon.py target/release/flac-bpm-analyzer.exe   # 应列出 7 
 
 ## 依赖说明
 
-| 依赖 | 版本 | 用途 |
-| --- | --- | --- |
-| `eframe` / `egui` | 0.32 | GUI 与桌面壳层 |
-| `symphonia` | 0.5（仅 `flac` + `mp3` feature） | FLAC / MP3 解码与元数据读取，不引入其它格式的编解码器 |
-| `rodio` | 0.23（仅 `playback` feature） | 音频输出（内部走 cpal/WASAPI），不引入自带解码器 |
-| `rfd` | 0.17 | 打开文件 / 保存 CSV 的原生对话框 |
+| 依赖 | 版本 | 用途 | 可选 feature |
+| --- | --- | --- | --- |
+| `eframe` / `egui` | 0.32 | GUI 与桌面壳层 | `gui` |
+| `symphonia` | 0.5（仅 `flac` + `mp3` feature） | FLAC / MP3 解码与元数据读取，不引入其它格式的编解码器 | 必选 |
+| `rodio` | 0.23（仅 `playback` feature） | 音频输出（内部走 cpal/WASAPI/ALSA），不引入自带解码器 | `playback` |
+| `rfd` | 0.17 | 打开文件 / 保存 CSV 的原生对话框 | `gui` |
+
+关闭 `gui` / `playback` 后对应依赖完全不参与编译（连 `cargo tree` 里都不会出现），
+所以纯命令行版在 Linux 上不需要 ALSA、X11，构建出的二进制也不 dlopen 它们。
 
 ## DSP 流程简介
 
