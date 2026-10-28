@@ -18,14 +18,15 @@ Windows 桌面 GUI 工具：导入单个 **FLAC 或 MP3** 文件 → 自动分�
 
 ## 编译与运行
 
-环境：Rust 1.99.1 / cargo 1.99.1（Windows 10 x86_64-pc-windows-msvc 下验证通过）。
+环境：Rust **1.88 及以上**（MSRV 写在 `Cargo.toml` 的 `rust-version`，本机用 1.99.1 在
+Windows 10 x86_64-pc-windows-msvc 下验证通过）。
 
 > `.cargo/config.toml` 已把 `+crt-static` 固化到 msvc 目标上，因此 `cargo build --release`
 > 直接产出可分发的单文件 exe（不依赖 `vcruntime140.dll`），发布时无需额外加参数。
 > 产物在 `target/release/flac-bpm-analyzer.exe`。
 
 ```bash
-cd "C:/Users/DM/Documents/New project/flac-bpm-analyzer"
+cd flac-bpm-analyzer        # 仓库根目录
 
 cargo build --release     # 发布构建
 cargo run --release       # 直接运行
@@ -34,7 +35,6 @@ cargo run --release       # 直接运行
 cargo run --release -- --selftest               # DSP 自检（合成鼓点，不需要音频文件）
 cargo run --release -- --analyze "某曲目.flac"   # 命令行分析单个 FLAC 并打印结果
 cargo run --release -- --playtest "某曲目.flac"  # 播放自检：解码→播放 2s→检查播放头是否真的推进
-```
 
 # 单元测试 + 离屏界面冒烟测试（不需要窗口/GPU）
 cargo test --release
@@ -44,8 +44,92 @@ cargo test --release
 节拍抽稀步长与悬停命中判定；`app::smoke_tests` 用 `egui::Context::run` 离屏跑真实帧，
 验证各缩放档位下界面不 panic、悬停时确实绘制出提示气泡、放大后确实出现滚动条滑块。
 
-首次构建需要下载依赖，仓库默认使用系统配置的 crates.io 镜像（本机为 rsproxy 镜像），
-全部为纯 Rust 依赖，Windows 下不需要额外安装系统库。
+首次构建需要下载依赖，仓库默认使用系统配置的 crates.io 镜像（本机为 rsproxy 镜像）。
+Windows 下全部为纯 Rust 依赖，不需要额外安装系统库；Linux 下需要装 ALSA 开发包，见下。
+
+### 在 Linux 上编译（alsa-sys 报错）
+
+播放链路是 rodio → cpal → `alsa-sys`，`alsa-sys` 的构建脚本会用 `pkg-config` 找 `alsa.pc`。
+只装了运行时库（`libasound2`）而没装**开发头文件**时，会停在：
+
+```
+error: failed to run custom build command for `alsa-sys v0.4.0`
+...
+Package alsa was not found in the pkg-config search path.
+```
+
+按发行版装开发包即可（顺带把 `pkg-config` 装上，两者缺一不可）：
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y libasound2-dev pkg-config
+# Fedora / RHEL / CentOS / Rocky / Alma
+sudo dnf install -y alsa-lib-devel pkgconf-pkg-config
+# Arch / Manjaro
+sudo pacman -S --needed alsa-lib pkgconf
+# Alpine（容器里常见）
+apk add --no-cache alsa-lib-dev pkgconf
+```
+
+验证：`pkg-config --libs alsa` 应输出 `-lasound`，然后重新 `cargo build --release`。
+
+Linux 下**只需要这一个 C 库**：窗口/输入走 winit（`dlopen` 方式加载 X11 与 Wayland，不需要 dev 包），
+文件对话框是 rfd 0.17 的纯 Rust 实现，不带 GTK 依赖。运行界面仍需有 X11/Wayland 会话
+和可用的音频输出设备；没有声卡时程序会自动降级为「模拟走时」，波形与节拍照常可用。
+
+### 若报错「rustc x.y is not supported by the following package」
+
+说明锁定的某个传递依赖把 MSRV 抬高了。例如：
+
+```
+error: rustc 1.88.0 is not supported by the following package:
+  uuid@1.29.0 requires rustc 1.89.0
+```
+
+`uuid` 是 eframe 在 Linux 上的无障碍栈（`accesskit_unix` → `zbus`）带进来的，
+**Windows 下并不参与编译**，但 cargo 在解析阶段会校验整张依赖图的 MSRV，照样报错。
+
+本仓库已经处理好：`Cargo.toml` 设了 `rust-version = "1.88"` 并启用 `resolver = "3"`
+（MSRV 感知解析，`cargo update` / `cargo add` 会优先选兼容 1.88 的版本），`Cargo.lock`
+把 `uuid` 钉在 `1.26.1`（最后一个仍支持 1.88 的版本）。
+
+遇到新的同类报错，按提示降到兼容版本即可，不要动 `rust-toolchain`：
+
+```bash
+cargo update <name>@<当前版本> --precise <兼容版本>
+# 例：cargo update -p uuid --precise 1.26.1
+```
+
+## 批量核对标签 BPM
+
+`tools/check_bpm_vs_tags.sh` 拿一个目录，把每个 `.flac` 的**标签 BPM**（metaflac 读取）
+和**本工具算出的 BPM** 并排放，输出对比表 + 统计。适合验证算法在你自己的曲库上准不准。
+
+```bash
+tools/check_bpm_vs_tags.sh "D:/Music"                # 递归扫整个目录
+tools/check_bpm_vs_tags.sh "D:/Music" --no-recursive # 只看本层
+tools/check_bpm_vs_tags.sh "D:/Music" --csv > out.csv # 导出 CSV 做二次统计
+tools/check_bpm_vs_tags.sh "D:/Music" -t 0.5         # 收紧「一致」容差到 0.5 BPM
+```
+
+标签依次尝试 `BPM` → `TBPM` → `TEMPO`（不同打标软件习惯不同），值里带小数或单位
+（`124.00`、`124 BPM`）都能识别。结论分六类：
+
+| 结论 | 含义 |
+| --- | --- |
+| 一致 | 差值在容差内（默认 1.0 BPM，覆盖标签取整的误差） |
+| 翻倍 | 测得 ≈ 标签 × 2，多为半速误判（见下文「半速陷阱」） |
+| 减半 | 测得 ≈ 标签 ÷ 2，反向的倍频错误 |
+| 偏差 | 既不在容差内，也不是 2 倍关系 |
+| 无标签 | 文件里没有 BPM / TBPM / TEMPO |
+| 异常 | 标签值不是有效数字，或解码/分析失败 |
+
+统计里的**平均绝对误差与最大偏差只统计「同倍频」样本**（一致 + 偏差）——
+翻倍/减半的差值天生是几十上百 BPM，混进去会让均值失去意义，它们单独计数。
+
+用法上两个前提：`metaflac` 要在 `PATH` 里（FLAC 工具集自带）；`target/release` 下有可执行文件
+（或 `-e` 指定）。每首都要完整解码一遍，约 0.3~2 秒/首，几百首的库请耐心等。
+
 
 ## 目录结构
 
@@ -67,6 +151,8 @@ cargo test --release
 | `assets/icon_256.rgba` | 窗口/任务栏图标，原始 RGBA，运行时 `include_bytes!` 直接用（免解码依赖） |
 | `tools/gen_icon.py` | 图标生成脚本（纯标准库：超采样渲染 + PNG/ICO 手写编码） |
 | `tools/check_icon.py` | 验证 exe 是否真的嵌入了图标（解析 PE 资源表） |
+| `tools/check_bpm_vs_tags.sh` | 批量比对「标签 BPM」与「算出的 BPM」，输出对比表 / CSV |
+| `tools/diag_*.py` | 测速链路的诊断脚本（复现管线、包络对照、合成信号对照），不影响编译 |
 
 ## 应用图标
 
