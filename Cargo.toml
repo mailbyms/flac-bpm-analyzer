@@ -2,6 +2,11 @@
 name = "flac-bpm-analyzer"
 version = "0.2.0"
 edition = "2021"
+# 最低支持的 Rust 版本（MSRV）。低于此版本编译会给出明确报错，而不是一堆语法/库 API 错误。
+rust-version = "1.88"
+# 解析器 v3 = 在 v2 基础上开启「MSRV 感知」：cargo update / cargo add 会优先挑选
+# 与本项目 rust-version 兼容的依赖版本，避免把依赖升到需要更高 rustc 的版本。
+resolver = "3"
 description = "音频节拍分析器：导入单个 FLAC / MP3，自动估计 BPM，展示波形与节拍"
 
 [dependencies]
