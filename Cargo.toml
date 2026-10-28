@@ -2,7 +2,7 @@
 name = "flac-bpm-analyzer"
 version = "0.1.0"
 edition = "2021"
-description = "FLAC BPM 节拍分析器：导入单个 FLAC，自动估计 BPM，展示波形与节拍"
+description = "音频节拍分析器：导入单个 FLAC / MP3，自动估计 BPM，展示波形与节拍"
 
 [dependencies]
 # ---------- GUI ----------
@@ -11,8 +11,8 @@ egui = "0.32"          # 与 eframe 内置版本保持一致
 egui_extras = "0.32"   # 少量额外组件 / 图片加载支持
 
 # ---------- 解码 ----------
-# 只启用 flac  feature，避免把 ogg/mp3 等无关编解码器拉进来
-symphonia = { version = "0.5", default-features = false, features = ["flac"] }
+# 只启用 flac + mp3，避免把 ogg/vorbis/aac 等无关编解码器拉进来
+symphonia = { version = "0.5", default-features = false, features = ["flac", "mp3"] }
 
 # ---------- 播放 ----------
 # 只启用 playback（cpal 输出），我们自行喂 SamplesBuffer，不需要 rodio 自带的解码器

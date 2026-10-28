@@ -1,4 +1,4 @@
-//! 自检：用合成信号验证 DSP 链路（不需要真实 FLAC 文件）
+//! 自检：用合成信号验证 DSP 链路（不需要真实音频文件）
 //!
 //! 运行：`cargo run --release -- --selftest`
 //! 生成若干已知 BPM 的鼓点信号，检查：
@@ -61,7 +61,7 @@ fn synth_click_track(bpm: f32, seconds: f32, sr: u32, first_beat: f32, seed: u64
     out
 }
 
-/// 命令行单文件分析：`cargo run --release -- --analyze <file.flac>`
+/// 命令行单文件分析：`cargo run --release -- --analyze <file.flac|file.mp3>`
 /// 用于在不启动界面的情况下验证「解码 + DSP」全链路是否正常。
 pub fn analyze_file(path: &std::path::Path) {
     use crate::analysis::{start_analysis, types::AnalysisEvent};
@@ -182,7 +182,7 @@ pub fn run() -> bool {
 
 /// 播放自检：解码 → 载入播放引擎 → 播放 2 秒 → 检查播放头是否真的推进
 ///
-/// 运行：`cargo run --release -- --playtest "某曲目.flac"`
+/// 运行：`cargo run --release -- --playtest "某曲目.flac" 或 "某曲目.mp3"`
 ///
 /// 判定依据：rodio 的 `get_pos()` 统计的是被输出设备**实际消费**的采样数，
 /// 只有真的在出声才会推进；若它不动，说明 source 根本没被播放（例如被 pause 卡住）。

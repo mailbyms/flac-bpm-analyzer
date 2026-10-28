@@ -40,7 +40,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "FLAC 节拍分析器",
+        "音频节拍分析器",
         options,
         Box::new(move |cc| {
             FlacBpmApp::configure(&cc.egui_ctx);

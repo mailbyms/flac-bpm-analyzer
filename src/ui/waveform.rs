@@ -32,14 +32,114 @@ const BEAT_HIT_TOLERANCE: f32 = 5.0;
 const REAL_SCROLL_THRESHOLD: f32 = 4.0;
 /// Ctrl + 滚轮每滚一档的缩放倍数
 const ZOOM_PER_NOTCH: f32 = 1.15;
+/// 波形柱子密度：聚合模式下每根柱大约占多少逻辑像素（1.0 = 与像素同密度）
+const BARS_PER_PIXEL: f32 = 1.0;
 
-/// 波形视图状态（缩放 + 起始时间）
+/// 把 x 对齐到物理像素网格。
+///
+/// 1px 宽的竖线若落在亚像素位置，egui 会做抗锯齿变成两个半透明像素；
+/// 滚动时这条线在「实心 / 两列半透明」之间来回变化，肉眼就是「一闪一闪」。
+/// 对齐到物理像素后位置只会整数跳动，亮度恒定。
+fn snap_x(x: f32, ppp: f32) -> f32 {
+    if ppp <= 0.0 {
+        return x;
+    }
+    (x * ppp).round() / ppp
+}
+
+/// 手工测速：右键点击波形，把两次点击的间隔当作一个节拍来反推 BPM。
+///
+/// 连续点击会累积多次间隔并取平均（tap tempo），比只取两次稳得多。
+#[derive(Default, Clone)]
+pub struct TapTempo {
+    /// 最近的点击时间（秒），最旧的在前面
+    taps: Vec<f32>,
+    /// 已采用的手工 BPM（用于指标卡标注；重新分析或重新测量不影响它）
+    pub applied: Option<f32>,
+}
+
+impl TapTempo {
+    /// 最多保留最近几次点击（取平均用）
+    const MAX_TAPS: usize = 6;
+    /// 两次点击的最小间隔（秒）：更短视为误触（否则会算出几百上千 BPM）
+    const MIN_INTERVAL: f32 = 0.1;
+
+    pub fn taps(&self) -> &[f32] {
+        &self.taps
+    }
+
+    pub fn clear(&mut self) {
+        self.taps.clear();
+        self.applied = None;
+    }
+
+    /// 记录一次点击；返回是否被接受（太近的误触会被丢弃）
+    pub fn on_click(&mut self, t: f32) -> bool {
+        if !t.is_finite() {
+            return false;
+        }
+        if let Some(&last) = self.taps.last() {
+            if (t - last).abs() < Self::MIN_INTERVAL {
+                return false;
+            }
+        }
+        self.taps.push(t);
+        if self.taps.len() > Self::MAX_TAPS {
+            self.taps.remove(0);
+        }
+        true
+    }
+
+    /// 最近一次「前一拍 → 这一拍」的区间，用于在波形上高亮
+    pub fn last_span(&self) -> Option<(f32, f32)> {
+        let n = self.taps.len();
+        if n < 2 {
+            return None;
+        }
+        Some((self.taps[n - 2], self.taps[n - 1]))
+    }
+
+    /// 平均间隔（秒）
+    pub fn mean_interval(&self) -> Option<f32> {
+        if self.taps.len() < 2 {
+            return None;
+        }
+        let mut sum = 0.0;
+        let mut count = 0;
+        for w in self.taps.windows(2) {
+            let d = w[1] - w[0];
+            if d >= Self::MIN_INTERVAL {
+                sum += d;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            None
+        } else {
+            Some(sum / count as f32)
+        }
+    }
+
+    /// 由平均间隔换算 BPM
+    pub fn bpm(&self) -> Option<f32> {
+        self.mean_interval()
+            .map(|d| 60.0 / d)
+            .filter(|b| b.is_finite() && *b > 0.0)
+    }
+}
+
+/// 波形视图状态（缩放 + 起始时间 + 跟随播放头）
 #[derive(Clone, Copy)]
 pub struct WaveViewState {
     /// 缩放倍数：1.0 = 整曲铺满
     pub zoom: f32,
     /// 可视窗口起始时间（秒）
     pub start_sec: f32,
+    /// 播放时是否让视图跟随播放头自动横向滚动
+    pub follow_playhead: bool,
+    /// 手动平移后的冷却截止时间（egui 时间，秒）。冷却期内不自动跟随，
+    /// 否则用户刚拖开看别的段落就被拽回去。
+    pub follow_hold_until: f64,
 }
 
 impl Default for WaveViewState {
@@ -47,6 +147,9 @@ impl Default for WaveViewState {
         Self {
             zoom: 1.0,
             start_sec: 0.0,
+            // 默认开启：放大后播放头跑出窗口是最常见的困惑点
+            follow_playhead: true,
+            follow_hold_until: 0.0,
         }
     }
 }
@@ -106,15 +209,54 @@ impl WaveViewState {
         let max_start = (duration - vis).max(0.0);
         self.start_sec = (self.start_sec + delta_sec).clamp(0.0, max_start);
     }
+
+    /// 记录一次手动平移：冷却期内不自动跟随
+    pub fn mark_manual_pan(&mut self, now: f64) {
+        self.follow_hold_until = now + Self::MANUAL_PAN_HOLD;
+    }
+
+    /// 手动平移后暂停跟随的时长（秒）
+    pub const MANUAL_PAN_HOLD: f64 = 2.0;
+
+    /// 居中跟随：返回让播放头落在窗口正中的新起点；已居中则返回 None。
+    ///
+    /// 受曲首/曲末约束：靠近两端时窗口会先贴住边界，播放头随之偏离中心
+    /// （曲首前半个窗口、曲末后半个窗口），这是居中跟随的固有行为。
+    pub fn follow_target(&self, duration: f32, pos: f32) -> Option<f32> {
+        let (t0, t1) = self.window(duration);
+        let vis = t1 - t0;
+        if vis <= 0.0 || !pos.is_finite() {
+            return None;
+        }
+        let max_start = (duration - vis).max(0.0);
+        let target = (pos - vis * 0.5).clamp(0.0, max_start);
+        // 目标与当前一致（例如全曲视图、或已贴住曲首/曲末边界）就不必动
+        if (target - t0).abs() < 1e-4 {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// 按需跟随播放头；返回是否发生了滚动
+    pub fn follow(&mut self, duration: f32, pos: f32) -> bool {
+        match self.follow_target(duration, pos) {
+            Some(s) => {
+                self.start_sec = s;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// 绘制整张「波形与节拍」卡片
 pub fn show_waveform_card(
     ui: &mut Ui,
     card_size: Vec2,
-    result: &AnalysisResult,
+    result: &mut AnalysisResult,
     audio: &mut AudioEngine,
     view: &mut WaveViewState,
+    tap: &mut TapTempo,
     info_text: &mut Option<String>,
 ) {
     let duration = result.duration;
@@ -149,9 +291,9 @@ pub fn show_waveform_card(
 
                 draw_toolbar(ui, toolbar_r, view, duration);
                 draw_ruler(ui, ruler_r, result, view);
-                draw_stage(ui, stage_r, result, audio, view, info_text);
+                draw_stage(ui, stage_r, result, audio, view, tap, info_text);
                 draw_scrollbar(ui, scroll_r, view, duration);
-                draw_transport(ui, transport_r, result, audio, view);
+                draw_transport(ui, transport_r, result, audio, view, tap);
             });
     });
 }
@@ -307,12 +449,15 @@ fn draw_scrollbar(ui: &mut Ui, rect: Rect, view: &mut WaveViewState, duration: f
     if drag_x != 0.0 {
         let max_off = (track.width() - thumb_w).max(1.0);
         view.pan(drag_x / max_off * duration, duration);
+        // 手动拖滚动条同样暂停自动跟随
+        view.mark_manual_pan(ui.input(|i| i.time));
     } else if resp.clicked() {
         // 点击轨道空白处 → 把点击位置移到窗口中心（点在滑块上则不动）
         if let Some(p) = resp.interact_pointer_pos() {
             if !thumb.contains(p) {
                 let r = ((p.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
                 view.start_sec = (r * duration - vis * 0.5).clamp(0.0, scrollable);
+                view.mark_manual_pan(ui.input(|i| i.time));
             }
         }
     }
@@ -336,12 +481,32 @@ fn draw_stage(
     result: &AnalysisResult,
     audio: &mut AudioEngine,
     view: &mut WaveViewState,
+    tap: &mut TapTempo,
     info_text: &mut Option<String>,
 ) {
     let duration = result.duration;
 
     // ---- 交互 ----
     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+
+    // 右键点击 = 手工测速打点（clicked() 只认左键，所以不会误移动播放头）
+    if resp.secondary_clicked() {
+        if let Some(p) = resp.hover_pos() {
+            let t = view.x_to_time(p.x, rect, duration).clamp(0.0, duration);
+            if tap.on_click(t) {
+                if let Some(bpm) = tap.bpm() {
+                    *info_text = Some(format!(
+                        "手工测速 · 平均间隔 {:.3}s · {:.1} BPM（已点击 {} 次）",
+                        tap.mean_interval().unwrap_or(0.0),
+                        bpm,
+                        tap.taps().len()
+                    ));
+                } else {
+                    *info_text = Some("手工测速：再右键点击一次确定一个节拍".to_string());
+                }
+            }
+        }
+    }
     let (ctrl_or_cmd, shift, raw_scroll, wheel_delta, zoom_delta) = ui.input(|i| {
         (
             i.modifiers.ctrl || i.modifiers.command,
@@ -373,6 +538,8 @@ fn draw_stage(
             let vis = view.visible_duration(duration);
             let speed = if shift { 0.012 } else { 0.004 };
             view.pan(-wheel_delta * speed * vis, duration);
+            // 手动滚动后短暂暂停自动跟随，避免刚拖开就被拽回播放头
+            view.mark_manual_pan(ui.input(|i| i.time));
         }
     }
 
@@ -428,13 +595,33 @@ fn draw_stage(
         None
     };
 
-    draw_waveform_layer(&painter, rect, cy, half_h, result, view, playhead);
-    draw_beat_layer(&painter, rect, result, view, hover_beat.map(|(i, _)| i));
-    draw_playhead(&painter, rect, cy, result, view, playhead);
+    let ppp = ui.ctx().pixels_per_point();
+    draw_waveform_layer(&painter, rect, cy, half_h, result, view, playhead, ppp);
+    draw_beat_layer(
+        &painter,
+        rect,
+        result,
+        view,
+        hover_beat.map(|(i, _)| i),
+        ppp,
+    );
+    draw_playhead(&painter, rect, cy, result, view, playhead, ppp);
+    draw_tap_marks(&painter, rect, result, view, tap, ppp);
 
-    // 悬浮提示画在最上层
-    if let (Some((idx, t)), Some(p)) = (hover_beat, resp.hover_pos()) {
-        draw_beat_tooltip(&painter, rect, p, idx, t, result);
+    // 光标：竖向参考线 + 时间提示（落在节拍线上时升级为节拍气泡）
+    if resp.hovered() {
+        if let Some(p) = resp.hover_pos() {
+            draw_cursor_line(&painter, rect, p.x, ppp);
+            match hover_beat {
+                Some((idx, t)) => draw_beat_tooltip(&painter, rect, p, idx, t, result),
+                None => {
+                    let t = view
+                        .x_to_time(p.x, rect, result.duration)
+                        .clamp(0.0, result.duration);
+                    draw_time_tooltip(&painter, rect, p, t);
+                }
+            }
+        }
     }
 }
 
@@ -489,33 +676,27 @@ fn beat_stride(px_per_beat: f32) -> usize {
     }
 }
 
-/// 节拍悬浮提示：拍号 + 时间码 + 小节内位置
-fn draw_beat_tooltip(
+/// 通用浮动提示气泡：若干行文本，跟随指针、越界自动翻转，始终收敛在舞台内
+fn draw_tooltip_box(
     painter: &Painter,
     rect: Rect,
     pointer: Pos2,
-    idx: usize,
-    t: f32,
-    result: &AnalysisResult,
+    lines: Vec<(std::sync::Arc<egui::Galley>, Color32)>,
 ) {
-    let bpb = result.beats_per_bar.max(1) as usize;
-    let g_num = painter.layout_no_wrap(format!("节拍 #{}", idx + 1), FontId::proportional(12.0), TEXT_SUB);
-    let g_time = painter.layout_no_wrap(format_timecode(t), FontId::monospace(16.0), BEAT);
-    let g_bar = painter.layout_no_wrap(
-        format!("第 {} 小节 · 第 {} 拍", idx / bpb + 1, idx % bpb + 1),
-        FontId::proportional(11.0),
-        TEXT_SUB,
-    );
-
+    if lines.is_empty() {
+        return;
+    }
     let pad_x = 11.0;
     let pad_y = 9.0;
     let line_gap = 3.0;
-    let w = [g_num.size().x, g_time.size().x, g_bar.size().x]
+    let w = lines
         .iter()
-        .copied()
+        .map(|(g, _)| g.size().x)
         .fold(0.0_f32, f32::max)
         + pad_x * 2.0;
-    let h = g_num.size().y + g_time.size().y + g_bar.size().y + line_gap * 2.0 + pad_y * 2.0;
+    let h = lines.iter().map(|(g, _)| g.size().y).sum::<f32>()
+        + line_gap * (lines.len() as f32 - 1.0)
+        + pad_y * 2.0;
 
     // 跟随指针，越界则翻转，最终收敛在舞台内
     let mut x = pointer.x + 16.0;
@@ -539,16 +720,139 @@ fn draw_beat_tooltip(
     painter.rect_filled(box_r, 8.0, Color32::WHITE);
     painter.rect_stroke(box_r, 8.0, Stroke::new(1.0_f32, BEIGE_LIGHT), StrokeKind::Outside);
 
-    // 先量出各行高度，避免 galley 被 move 后再借用
-    let h_num = g_num.size().y;
-    let h_time = g_time.size().y;
-
     let mut cy = box_r.top() + pad_y;
-    painter.galley(Pos2::new(box_r.left() + pad_x, cy), g_num, TEXT_SUB);
-    cy += h_num + line_gap;
-    painter.galley(Pos2::new(box_r.left() + pad_x, cy), g_time, BEAT);
-    cy += h_time + line_gap;
-    painter.galley(Pos2::new(box_r.left() + pad_x, cy), g_bar, TEXT_SUB);
+    for (g, color) in lines {
+        let h = g.size().y;
+        painter.galley(Pos2::new(box_r.left() + pad_x, cy), g, color);
+        cy += h + line_gap;
+    }
+}
+
+/// 节拍悬浮提示：拍号 + 时间码 + 小节内位置
+fn draw_beat_tooltip(
+    painter: &Painter,
+    rect: Rect,
+    pointer: Pos2,
+    idx: usize,
+    t: f32,
+    result: &AnalysisResult,
+) {
+    let bpb = result.beats_per_bar.max(1) as usize;
+    let g_num = painter.layout_no_wrap(
+        format!("节拍 #{}", idx + 1),
+        FontId::proportional(12.0),
+        TEXT_SUB,
+    );
+    let g_time = painter.layout_no_wrap(format_timecode(t), FontId::monospace(16.0), BEAT);
+    let g_bar = painter.layout_no_wrap(
+        format!("第 {} 小节 · 第 {} 拍", idx / bpb + 1, idx % bpb + 1),
+        FontId::proportional(11.0),
+        TEXT_SUB,
+    );
+    draw_tooltip_box(
+        painter,
+        rect,
+        pointer,
+        vec![(g_num, TEXT_SUB), (g_time, BEAT), (g_bar, TEXT_SUB)],
+    );
+}
+
+/// 光标时间提示：指针在舞台上任何位置都实时显示该处时间码
+fn draw_time_tooltip(painter: &Painter, rect: Rect, pointer: Pos2, t: f32) {
+    let g = painter.layout_no_wrap(format_timecode(t), FontId::monospace(15.0), TEXT);
+    draw_tooltip_box(painter, rect, pointer, vec![(g, TEXT)]);
+}
+
+/// 手工测速标记层：点击点 + 最近一个节拍区间 + BPM 胶囊
+fn draw_tap_marks(
+    painter: &Painter,
+    rect: Rect,
+    result: &AnalysisResult,
+    view: &WaveViewState,
+    tap: &TapTempo,
+    ppp: f32,
+) {
+    let taps = tap.taps();
+    if taps.is_empty() {
+        return;
+    }
+    let duration = result.duration;
+    let (t0, t1) = view.window(duration);
+    let light = Color32::from_rgba_unmultiplied(0xE0, 0x78, 0x56, 130);
+
+    // 最近一个节拍区间：浅橙底 + 两条实线
+    if let Some((a, b)) = tap.last_span() {
+        let xa = snap_x(view.time_to_x(a, rect, duration), ppp);
+        let xb = snap_x(view.time_to_x(b, rect, duration), ppp);
+        if xb > xa {
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(xa, rect.top()), Pos2::new(xb, rect.bottom())),
+                0.0,
+                Color32::from_rgba_unmultiplied(0xE0, 0x78, 0x56, 20),
+            );
+        }
+        for x in [xa, xb] {
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(1.5_f32, PRIMARY),
+            );
+        }
+    }
+
+    // 每次点击：细虚线 + 顶部圆点
+    for &t in taps {
+        if t < t0 || t > t1 {
+            continue;
+        }
+        let x = snap_x(view.time_to_x(t, rect, duration), ppp);
+        let mut y = rect.top();
+        let mut on = true;
+        while y < rect.bottom() {
+            let len = if on { 5.0 } else { 4.0 };
+            let y_end = (y + len).min(rect.bottom());
+            if on {
+                painter.line_segment(
+                    [Pos2::new(x, y), Pos2::new(x, y_end)],
+                    Stroke::new(1.0_f32, light),
+                );
+            }
+            y = y_end;
+            on = !on;
+        }
+        painter.circle_filled(Pos2::new(x, rect.top() + 4.0), 3.0, PRIMARY);
+    }
+
+    // BPM 胶囊：锚在最后一次点击处，越界自动收敛在舞台内
+    if let (Some(bpm), Some(&last)) = (tap.bpm(), taps.last()) {
+        let x = view.time_to_x(last, rect, duration);
+        let text = format!(
+            "{:.1} BPM · {:.3}s",
+            bpm,
+            tap.mean_interval().unwrap_or(0.0)
+        );
+        let g = painter.layout_no_wrap(text, FontId::monospace(14.0), Color32::WHITE);
+        let pad_x = 10.0;
+        let w = g.size().x + pad_x * 2.0;
+        let h = g.size().y + 8.0;
+        let left = (x - w / 2.0).clamp(rect.left() + 4.0, (rect.right() - 4.0 - w).max(rect.left() + 4.0));
+        let box_r = Rect::from_min_size(Pos2::new(left, rect.top() + 6.0), Vec2::new(w, h));
+        painter.rect_filled(box_r, 7.0, DOWNBEAT);
+        painter.galley(
+            Pos2::new(box_r.left() + pad_x, box_r.top() + 4.0),
+            g,
+            Color32::WHITE,
+        );
+    }
+}
+
+/// 跟随光标的竖向参考线（比播放头更淡，避免与橙色播放头混淆）
+fn draw_cursor_line(painter: &Painter, rect: Rect, x: f32, ppp: f32) {
+    let color = Color32::from_rgba_unmultiplied(0x8C, 0x7F, 0x6B, 70);
+    let x = snap_x(x, ppp);
+    painter.line_segment(
+        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+        Stroke::new(1.0_f32, color),
+    );
 }
 
 /// ① 波形层
@@ -560,6 +864,7 @@ fn draw_waveform_layer(
     result: &AnalysisResult,
     view: &WaveViewState,
     playhead: f32,
+    ppp: f32,
 ) {
     // 中轴线
     painter.line_segment(
@@ -567,79 +872,116 @@ fn draw_waveform_layer(
         Stroke::new(1.0_f32, BEIGE_LIGHT),
     );
 
-    let peaks = &result.waveform_peaks;
-    if peaks.is_empty() || result.duration <= 0.0 {
-        return;
+    let bars = waveform_bars(rect, result.duration, &result.waveform_peaks, view, half_h, ppp);
+
+    // 先画未播放（米色），再画已播放（橙色）
+    let mut played_shapes: Vec<Shape> = Vec::with_capacity(bars.len());
+    let mut rest_shapes: Vec<Shape> = Vec::with_capacity(bars.len());
+    for bar in bars {
+        let (x, h) = (bar.x, bar.h);
+        let points = [Pos2::new(x, cy - h), Pos2::new(x, cy + h)];
+        if bar.t <= playhead {
+            played_shapes.push(Shape::LineSegment {
+                points,
+                stroke: Stroke::new(1.0_f32, PRIMARY),
+            });
+        } else {
+            rest_shapes.push(Shape::LineSegment {
+                points,
+                stroke: Stroke::new(1.0_f32, BEIGE),
+            });
+        }
     }
-    let duration = result.duration;
+    painter.extend(rest_shapes);
+    painter.extend(played_shapes);
+}
+
+/// 一根波形柱子
+#[derive(Clone, Copy, Debug)]
+struct WaveBar {
+    /// 屏幕 x 坐标
+    x: f32,
+    /// 半幅（像素）
+    h: f32,
+    /// 该柱代表的时间（秒）。聚合模式下是桶组中心，插值模式下是像素列左端。
+    /// 与播放头比较决定颜色（已播放橙 / 未播放米色）。
+    t: f32,
+}
+
+/// 计算波形柱子。
+///
+/// 抽成纯函数是为了可测——「滚动时柱高必须稳定」这个性质只能靠比对前后两帧来验证。
+fn waveform_bars(
+    rect: Rect,
+    duration: f32,
+    peaks: &[f32],
+    view: &WaveViewState,
+    half_h: f32,
+    ppp: f32,
+) -> Vec<WaveBar> {
+    if peaks.is_empty() || duration <= 0.0 {
+        return Vec::new();
+    }
     let (t0, t1) = view.window(duration);
     let visible = (t1 - t0).max(1e-6);
     let cols = (rect.width().ceil() as usize).max(1);
     let scale = peaks.len() as f32 / duration;
+    let bucket_per_px = scale * visible / rect.width().max(1.0);
 
-    let mut played_shapes: Vec<Shape> = Vec::with_capacity(cols);
-    let mut rest_shapes: Vec<Shape> = Vec::with_capacity(cols);
+    let mut bars: Vec<WaveBar> = Vec::with_capacity(cols);
 
-    for i in 0..cols {
-        let x = rect.left() + i as f32;
-        let ta = t0 + visible * (i as f32 / cols as f32);
-        let tb = t0 + visible * ((i + 1) as f32 / cols as f32);
-        let mut b0 = (ta * scale).floor() as i64;
-        let mut b1 = (tb * scale).ceil() as i64;
-        b0 = b0.clamp(0, peaks.len() as i64 - 1);
-        b1 = b1.clamp(b0 + 1, peaks.len() as i64);
-
-        let amp = if (b1 - b0) <= 1 {
-            // 高倍放大：桶比像素还密，用线性插值避免台阶感
+    if bucket_per_px > 1.0 {
+        // ---- 聚合模式（缩小到桶比像素密）----
+        // 关键：分组锚定在**全局固定的桶网格**上（每 k 个桶一根柱），而不是「每个像素列
+        // 取该列时间区间的最大值」。后者在滚动时区间滑动，最大值会在相邻桶之间跳变，
+        // 柱高逐帧突变 —— 视觉上就是整片波形在闪。锚定到桶后，滚动只是整体平移。
+        let k = (bucket_per_px * BARS_PER_PIXEL).round().max(1.0) as usize;
+        let g_first = ((t0 * scale) / k as f32).floor() as i64 - 1;
+        let g_last = ((t1 * scale) / k as f32).ceil() as i64 + 1;
+        for g in g_first.max(0)..=g_last {
+            let b0 = g as usize * k;
+            if b0 >= peaks.len() {
+                break;
+            }
+            let b1 = (b0 + k).min(peaks.len());
+            let amp = peaks[b0..b1].iter().copied().fold(0.0f32, f32::max);
+            if amp <= 0.0005 {
+                continue;
+            }
+            let t_center = (b0 as f32 + (b1 - b0) as f32 * 0.5) / scale;
+            // 这里**不做像素对齐**：柱间距约 1px，对齐会让相邻组挤到同一物理像素上互相覆盖。
+            // 高度已稳定，轻微亚像素抗锯齿反而是平滑的（波形像一张图整体平移）。
+            let x = view.time_to_x(t_center, rect, duration);
+            bars.push(WaveBar {
+                x,
+                h: (amp * half_h).max(0.5),
+                t: t_center,
+            });
+        }
+    } else {
+        // ---- 插值模式（放大到桶比像素稀）----
+        // 每像素一列、线性插值取样：取值随 t0 连续变化，不会跳变。
+        for i in 0..cols {
+            let x = snap_x(rect.left() + i as f32, ppp);
+            let ta = t0 + visible * (i as f32 / cols as f32);
             let p = ta * scale;
             let i0 = p.floor() as usize;
             let frac = p - i0 as f32;
             let v0 = peaks[i0.min(peaks.len() - 1)];
             let v1 = peaks[(i0 + 1).min(peaks.len() - 1)];
-            v0 + (v1 - v0) * frac
-        } else {
-            let mut m = 0f32;
-            for k in b0..b1 {
-                let v = peaks[k as usize];
-                if v > m {
-                    m = v;
-                }
+            let amp = v0 + (v1 - v0) * frac;
+            if amp <= 0.0005 {
+                continue;
             }
-            m
-        };
-        if amp <= 0.0005 {
-            continue;
-        }
-        let h = (amp * half_h).max(0.5);
-        let seg = Shape::LineSegment {
-            points: [Pos2::new(x, cy - h), Pos2::new(x, cy + h)],
-            stroke: Stroke::new(1.0_f32, Color32::TRANSPARENT),
-        };
-        if ta <= playhead {
-            played_shapes.push(seg);
-        } else {
-            rest_shapes.push(seg);
+            bars.push(WaveBar {
+                x,
+                h: (amp * half_h).max(0.5),
+                t: ta,
+            });
         }
     }
 
-    // 先画未播放（米色），再画已播放（橙色）；颜色统一在此替换
-    let make = |shapes: Vec<Shape>, color: Color32| -> Vec<Shape> {
-        shapes
-            .into_iter()
-            .map(|s| {
-                if let Shape::LineSegment { points, .. } = s {
-                    Shape::LineSegment {
-                        points,
-                        stroke: Stroke::new(1.0_f32, color),
-                    }
-                } else {
-                    s
-                }
-            })
-            .collect()
-    };
-    painter.extend(make(rest_shapes, BEIGE));
-    painter.extend(make(played_shapes, PRIMARY));
+    bars
 }
 
 /// 指针在可视窗口内的相对位置（0~1），用作缩放锚点
@@ -659,6 +1001,7 @@ fn draw_beat_layer(
     result: &AnalysisResult,
     view: &WaveViewState,
     hover: Option<usize>,
+    ppp: f32,
 ) {
     let duration = result.duration;
     let (t0, t1) = view.window(duration);
@@ -682,7 +1025,8 @@ fn draw_beat_layer(
                 break;
             }
             if t >= t0 {
-                let x = view.time_to_x(t, rect, duration);
+                // 对齐物理像素：细线在亚像素位置滚动时会忽明忽暗
+                let x = snap_x(view.time_to_x(t, rect, duration), ppp);
                 if (idx as usize) % stride == 0 {
                     let is_downbeat = (idx as usize) % result.beats_per_bar.max(1) as usize == 0;
                     let hi = hover == Some(idx as usize);
@@ -740,12 +1084,13 @@ fn draw_playhead(
     result: &AnalysisResult,
     view: &WaveViewState,
     playhead: f32,
+    ppp: f32,
 ) {
     let (t0, t1) = view.window(result.duration);
     if playhead < t0 || playhead > t1 {
         return;
     }
-    let x = view.time_to_x(playhead, rect, result.duration);
+    let x = snap_x(view.time_to_x(playhead, rect, result.duration), ppp);
     painter.line_segment(
         [Pos2::new(x, rect.top() - 6.0), Pos2::new(x, rect.bottom())],
         Stroke::new(1.5_f32, PRIMARY),
@@ -813,9 +1158,10 @@ fn play_pause_shapes(c: Pos2, playing: bool) -> Vec<Shape> {
 fn draw_transport(
     ui: &mut Ui,
     rect: Rect,
-    result: &AnalysisResult,
+    result: &mut AnalysisResult,
     audio: &mut AudioEngine,
     view: &mut WaveViewState,
+    tap: &mut TapTempo,
 ) {
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
         ui.horizontal_centered(|ui| {
@@ -847,6 +1193,22 @@ fn draw_transport(
                     view.zoom = 1.0;
                     view.start_sec = 0.0;
                 }
+                ui.add_space(6.0);
+                if toggle_chip(
+                    ui,
+                    if view.follow_playhead {
+                        "跟随播放头 · 开"
+                    } else {
+                        "跟随播放头 · 关"
+                    },
+                    view.follow_playhead,
+                    "开启后播放时波形自动横向滚动，让播放头始终保持在窗口正中；\n手动滚动波形会暂停跟随 2 秒，避免相互打架。",
+                ) {
+                    view.follow_playhead = !view.follow_playhead;
+                }
+                ui.add_space(6.0);
+                draw_tap_controls(ui, result, tap);
+
                 ui.label(
                     RichText::new(format!(
                         "共 {} 拍 · {:.1} BPM",
@@ -861,6 +1223,83 @@ fn draw_transport(
     });
 }
 
+/// 手工测速的显示与操作。
+///
+/// 调用点在 `right_to_left` 布局里，因此**先 add 的显示在更右边**：
+/// 最终视觉顺序是 `文本 · 采用 · 清除`。
+fn draw_tap_controls(ui: &mut Ui, result: &mut AnalysisResult, tap: &mut TapTempo) {
+    if let Some(bpm) = tap.bpm() {
+        if mini_button(ui, "清除", false) {
+            tap.clear();
+            return;
+        }
+        ui.add_space(4.0);
+        if mini_button(ui, "采用此 BPM", true) {
+            if let Some((first, _)) = tap.last_span() {
+                // 以「区间起点」作为首拍，这样节拍线会和刚量出的那一拍对齐
+                apply_tap_bpm(result, bpm, first);
+                tap.applied = Some(bpm);
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "手工 {:.1} BPM · 间隔 {:.3}s · {} 次",
+                bpm,
+                tap.mean_interval().unwrap_or(0.0),
+                tap.taps().len()
+            ))
+            .size(12.0)
+            .color(PRIMARY),
+        );
+    } else if tap.taps().len() == 1 {
+        ui.label(
+            RichText::new("再右键点击一次确定一个节拍")
+                .size(12.0)
+                .color(PRIMARY),
+        );
+    } else {
+        ui.label(
+            RichText::new("右键点击波形可手工测速")
+                .size(11.5)
+                .color(TEXT_SUB),
+        );
+    }
+}
+
+/// 把手工测得的 BPM 应用到分析结果：更新 BPM、首拍偏移，并按新周期重建节拍序列。
+///
+/// 抽成独立函数既方便测试，也避免把「改结果」的副作用散落在 UI 代码里。
+pub fn apply_tap_bpm(result: &mut AnalysisResult, bpm: f32, first_beat: f32) {
+    if !bpm.is_finite() || bpm <= 0.0 {
+        return;
+    }
+    result.bpm = bpm;
+    result.first_beat_offset = first_beat.max(0.0);
+    result.beats = crate::analysis::dsp::generate_beats(
+        result.first_beat_offset,
+        60.0 / bpm,
+        result.duration,
+    );
+}
+
+/// 小号按钮（测量条用）
+fn mini_button(ui: &mut Ui, text: &str, primary: bool) -> bool {
+    let (fg, fill, stroke) = if primary {
+        (Color32::WHITE, PRIMARY, Stroke::NONE)
+    } else {
+        (TEXT_SUB, Color32::TRANSPARENT, outline_stroke())
+    };
+    ui.add(
+        egui::Button::new(RichText::new(text).size(12.0).color(fg))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(8.0)
+            .min_size(Vec2::new(0.0, 28.0)),
+    )
+    .clicked()
+}
+
 /// 描边按钮（次要操作）
 pub fn outline_button(ui: &mut Ui, text: &str) -> bool {
     let btn = egui::Button::new(RichText::new(text).size(13.0).color(TEXT))
@@ -869,6 +1308,21 @@ pub fn outline_button(ui: &mut Ui, text: &str) -> bool {
         .corner_radius(CONTROL_RADIUS)
         .min_size(Vec2::new(0.0, 30.0));
     ui.add(btn).clicked()
+}
+
+/// 可切换按钮：开启时实心橙 + 白字，关闭时描边灰字
+fn toggle_chip(ui: &mut Ui, text: &str, active: bool, hint: &str) -> bool {
+    let (fg, fill, stroke) = if active {
+        (Color32::WHITE, PRIMARY, Stroke::NONE)
+    } else {
+        (TEXT_SUB, Color32::TRANSPARENT, outline_stroke())
+    };
+    let btn = egui::Button::new(RichText::new(text).size(12.5).color(fg))
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CONTROL_RADIUS)
+        .min_size(Vec2::new(0.0, 30.0));
+    ui.add(btn).on_hover_text(hint).clicked()
 }
 
 /// 主按钮（实心橙）
@@ -958,6 +1412,194 @@ mod tests {
         }
     }
 
+    /// 居中跟随：播放头应被钉在窗口正中（受曲首/曲末边界约束）
+    #[test]
+    fn 跟随播放头保持居中() {
+        let duration = 100.0;
+        let mut view = WaveViewState {
+            zoom: 10.0,
+            start_sec: 20.0,
+            ..Default::default()
+        };
+        let vis = view.visible_duration(duration); // 10s，窗口 [20, 30]
+
+        // 已经在中心 → 不动
+        assert_eq!(view.follow_target(duration, 25.0), None, "已居中不应滚动");
+
+        // 偏右 → 滚动到居中
+        let target = view.follow_target(duration, 26.0).expect("偏离中心应滚动");
+        view.start_sec = target;
+        let (t0, t1) = view.window(duration);
+        assert!((26.0 - (t0 + t1) * 0.5).abs() < 1e-3, "播放头应在窗口正中");
+        assert!((26.0 - t0 - vis * 0.5).abs() < 1e-3, "偏移应为半窗口");
+
+        // 偏左（用户拖到后面又播放）同样居中
+        view.start_sec = 60.0;
+        let target = view.follow_target(duration, 30.0).expect("偏左应滚动");
+        assert!((30.0 - target - vis * 0.5).abs() < 1e-3);
+
+        // 曲首：窗口贴住 0，播放头无法居中（这是居中跟随的固有边界行为）
+        let target = view.follow_target(duration, 1.0).expect("应滚动");
+        assert_eq!(target, 0.0, "曲首应贴住起点");
+
+        // 曲末：起点不能超过 max_start
+        view.start_sec = 80.0;
+        let target = view.follow_target(duration, 99.9).expect("曲末应滚动");
+        assert!(
+            target <= duration - vis + 1e-3,
+            "起点超出可滚动范围：{target}"
+        );
+
+        // 全曲视图：整曲都在窗口内，居中位置就是起点 0
+        let full = WaveViewState {
+            zoom: 1.0,
+            start_sec: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(full.follow_target(duration, 50.0), None);
+    }
+
+    /// 手工测速：两次点击间隔即一个节拍
+    #[test]
+    fn 两次点击算出bpm() {
+        let mut tap = TapTempo::default();
+        assert!(tap.on_click(10.0));
+        assert_eq!(tap.bpm(), None, "只点一次还不能算");
+        assert!(tap.on_click(10.5));
+        let bpm = tap.bpm().expect("两次点击应能算出 BPM");
+        assert!((bpm - 120.0).abs() < 1e-3, "间隔 0.5s 应为 120 BPM，实际 {bpm}");
+        assert_eq!(tap.last_span(), Some((10.0, 10.5)));
+    }
+
+    /// 多次点击取平均（tap tempo），比单次更稳
+    #[test]
+    fn 多次点击取平均间隔() {
+        let mut tap = TapTempo::default();
+        for t in [0.0, 0.5, 1.02, 1.5] {
+            tap.on_click(t);
+        }
+        // 间隔 0.5 / 0.52 / 0.48 → 平均 0.5
+        let mean = tap.mean_interval().unwrap();
+        assert!((mean - 0.5).abs() < 1e-3, "平均间隔应约 0.5s，实际 {mean}");
+        assert!((tap.bpm().unwrap() - 120.0).abs() < 0.5);
+    }
+
+    /// 过近的点击视为误触，直接忽略（否则会算出几百上千 BPM）
+    #[test]
+    fn 过近的点击被忽略() {
+        let mut tap = TapTempo::default();
+        assert!(tap.on_click(5.0));
+        assert!(!tap.on_click(5.02), "20ms 内应视为误触");
+        assert_eq!(tap.taps().len(), 1);
+        assert!(tap.on_click(5.5));
+        assert_eq!(tap.taps().len(), 2);
+    }
+
+    /// 只保留最近若干次点击
+    #[test]
+    fn 点击次数有上限() {
+        let mut tap = TapTempo::default();
+        for i in 0..20 {
+            tap.on_click(i as f32 * 0.5);
+        }
+        assert!(tap.taps().len() <= TapTempo::MAX_TAPS);
+        // 保留的应是最近的（间隔仍为 0.5s）
+        assert!((tap.mean_interval().unwrap() - 0.5).abs() < 1e-3);
+    }
+
+    /// 清除后回到未测量状态（同时清掉"已采用"标记）
+    #[test]
+    fn 清除测速状态() {
+        let mut tap = TapTempo::default();
+        tap.on_click(1.0);
+        tap.on_click(1.5);
+        tap.applied = Some(120.0);
+        tap.clear();
+        assert!(tap.taps().is_empty());
+        assert_eq!(tap.bpm(), None);
+        assert_eq!(tap.applied, None);
+    }
+
+    /// 采用手工 BPM：更新数值、首拍偏移并重建节拍序列
+    #[test]
+    fn 采用手工bpm会重建节拍序列() {
+        let mut r = fake_result(); // 60s / 120 BPM / 首拍 0
+        apply_tap_bpm(&mut r, 60.0, 1.0);
+        assert!((r.bpm - 60.0).abs() < 1e-4);
+        assert!((r.first_beat_offset - 1.0).abs() < 1e-4);
+        assert!((r.beats[0] - 1.0).abs() < 1e-4, "首拍应对齐测量起点");
+        assert!((r.beats[1] - 2.0).abs() < 1e-4, "周期应为 1s");
+        assert_eq!(r.beats.len(), 59, "1s 起、1s 周期、到 60s 共 59 拍");
+    }
+
+    /// 滚动时柱高必须稳定：否则柱高逐帧跳变会让整片波形「一闪一闪」。
+    ///
+    /// 造一份有区分度的 peaks，比较滚动前后的柱高集合——聚合模式锚定在固定桶网格上，
+    /// 滚动只是整体平移，柱高应几乎完全一致（只有边缘进出可视区的少数柱子不同）。
+    #[test]
+    fn 滚动时波形柱高保持稳定() {
+        let duration = 240.0;
+        let n = 8192;
+        // 有区分度的伪随机包络（不用 rand，保证可复现）
+        let mut seed = 12345u64;
+        let peaks: Vec<f32> = (0..n)
+            .map(|i| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let r = ((seed >> 33) as f32) / (u32::MAX as f32);
+                (0.15 + 0.8 * r) * (0.6 + 0.4 * ((i as f32) * 0.01).sin())
+            })
+            .collect();
+
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1376.0, 300.0));
+        let half_h = 140.0;
+        // 必须 zoom > 1：整曲视图下 start_sec 会被 clamp 到 0，两帧其实是同一个视图
+        // zoom=2 → 可视 120s，bucket_per_px≈2.98 → 聚合模式 k=3
+        let mk = |start: f32| WaveViewState {
+            zoom: 2.0,
+            start_sec: start,
+            ..Default::default()
+        };
+
+        // 滚动 0.05s ≈ 0.57px，匹配窗口取 1.0px 即可稳定对齐同一根柱子
+        let bars_a = waveform_bars(rect, duration, &peaks, &mk(60.0), half_h, 1.0);
+        let bars_b = waveform_bars(rect, duration, &peaks, &mk(60.05), half_h, 1.0);
+        assert!(bars_a.len() > 500, "应有足够多的柱子（{}）", bars_a.len());
+
+        // 按「柱子代表的时间」匹配：聚合模式的组网格固定，同一组在两帧里 t 完全相同，
+        // 所以只比较同名 t 的柱高即可。这样不会因为 x 只差 1px 而误配到相邻组。
+        let key = |t: f32| (t * 1000.0).round() as i64;
+        let map_b: std::collections::HashMap<i64, f32> =
+            bars_b.iter().map(|b| (key(b.t), b.h)).collect();
+
+        let mut same = 0usize;
+        let mut compared = 0usize;
+        for b in &bars_a {
+            if let Some(hb) = map_b.get(&key(b.t)) {
+                compared += 1;
+                if (b.h - hb).abs() < 1e-3 {
+                    same += 1;
+                }
+            }
+        }
+        assert!(compared > 300, "可比较的柱子太少（{compared}）");
+        let ratio = same as f32 / compared as f32;
+        assert!(
+            ratio > 0.98,
+            "同一时间位置的柱高应完全稳定（实际稳定率 {:.1}%），否则滚动时波形会闪",
+            ratio * 100.0
+        );
+    }
+
+    /// 手动平移会开启 2 秒冷却，冷却期内不自动跟随
+    #[test]
+    fn 手动平移暂停跟随两秒() {
+        let mut view = WaveViewState::default();
+        view.mark_manual_pan(10.0);
+        assert!((view.follow_hold_until - 12.0).abs() < 1e-6);
+        // follow 本身不看冷却（由 app 层判断），这里只验证时间戳写对
+        assert!(view.follow_hold_until > 10.0);
+    }
+
     #[test]
     fn 抽稀步长随间距变化() {
         assert_eq!(beat_stride(20.0), 1);
@@ -971,7 +1613,7 @@ mod tests {
     fn 滚动条拖动滑块跟手() {
         let duration = 100.0;
         let track_w = 1000.0;
-        let mut view = WaveViewState { zoom: 4.0, start_sec: 0.0 };
+        let mut view = WaveViewState { zoom: 4.0, start_sec: 0.0, ..Default::default() };
         let (t0, t1) = view.window(duration);
         let vis = t1 - t0;
         let thumb_w = (track_w * (vis / duration)).max(SCROLL_THUMB_MIN_W).min(track_w);
@@ -991,7 +1633,7 @@ mod tests {
     #[test]
     fn 滚动条平移不越界() {
         let duration = 100.0;
-        let mut view = WaveViewState { zoom: 10.0, start_sec: 0.0 };
+        let mut view = WaveViewState { zoom: 10.0, start_sec: 0.0, ..Default::default() };
         view.pan(-999.0, duration);
         assert_eq!(view.window(duration).0, 0.0);
         view.pan(999.0, duration);
@@ -1004,7 +1646,7 @@ mod tests {
     fn 悬停命中节拍线() {
         let r = fake_result();
         let rect = stage_rect();
-        let view = WaveViewState { zoom: 1.0, start_sec: 0.0 };
+        let view = WaveViewState { zoom: 1.0, start_sec: 0.0, ..Default::default() };
 
         // 全曲视图：第 4 拍（0 基）在 t=2.0s → x = 2/60*1000
         let x = view.time_to_x(2.0, rect, r.duration);
@@ -1025,7 +1667,7 @@ mod tests {
     fn 放大后两拍之间不误命中() {
         let r = fake_result();
         let rect = stage_rect();
-        let view = WaveViewState { zoom: 8.0, start_sec: 1.0 };
+        let view = WaveViewState { zoom: 8.0, start_sec: 1.0, ..Default::default() };
         // 窗口 [1.0, 8.5]，t=2.0 与 t=2.5 之间取中点 2.25s
         let x = view.time_to_x(2.25, rect, r.duration);
         assert!(hovered_beat(Pos2::new(x, 150.0), rect, &r, &view).is_none());
@@ -1038,7 +1680,7 @@ mod tests {
     fn 窗口外的拍不参与命中() {
         let r = fake_result();
         let rect = stage_rect();
-        let view = WaveViewState { zoom: 8.0, start_sec: 20.0 };
+        let view = WaveViewState { zoom: 8.0, start_sec: 20.0, ..Default::default() };
         // t=2.0 在窗口 [20, 27.5] 之外
         let x = view.time_to_x(2.0, rect, r.duration);
         assert!(hovered_beat(Pos2::new(x, 150.0), rect, &r, &view).is_none());

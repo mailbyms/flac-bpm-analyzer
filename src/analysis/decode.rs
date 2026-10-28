@@ -1,9 +1,11 @@
-//! FLAC 解码：symphonia → 单声道 f32 分析流 + 原始交错 PCM（用于播放）
+//! 音频解码（FLAC / MP3）：symphonia → 单声道 f32 分析流 + 原始交错 PCM（用于播放）
 //!
 //! 关键点：
-//! 1. 只注册 FLAC 解码器/格式，避免无关依赖；
+//! 1. 只启用 FLAC 与 MP3 解码器/格式，避免无关依赖；
 //! 2. 解码循环中同时做「多声道混音」与「原始交错 PCM 保留（播放用）」；
-//! 3. 用一个带字节计数的 MediaSource 包装器汇报真实进度。
+//! 3. 用一个带字节计数的 MediaSource 包装器汇报真实进度；
+//! 4. `FormatOptions::enable_gapless` 已开：MP3 若带 LAME 头可裁掉编码器延迟，
+//!    避免首拍偏移整体后移（约 576 samples）。
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -75,9 +77,9 @@ impl MediaSource for ProgressSource {
     }
 }
 
-/// 打开并解码 FLAC 文件。
+/// 打开并解码音频文件（FLAC / MP3，由 symphonia 按扩展名提示 + 探测结果自动识别）。
 /// `progress` 回调接收 0.0~1.0 的进度值。
-pub fn decode_flac(path: &Path, mut progress: impl FnMut(f32)) -> Result<DecodedAudio, AnalysisError> {
+pub fn decode_audio(path: &Path, mut progress: impl FnMut(f32)) -> Result<DecodedAudio, AnalysisError> {
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let file = File::open(path)?;
 

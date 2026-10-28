@@ -14,7 +14,7 @@ use crate::audio::{AudioEngine, PlaybackMode};
 use crate::export::{export_beats_csv, format_timecode};
 use crate::theme::*;
 use crate::ui::waveform::{
-    jump_to_beat, outline_button, primary_button, show_waveform_card, WaveViewState,
+    jump_to_beat, outline_button, primary_button, show_waveform_card, TapTempo, WaveViewState,
 };
 
 /// 文件卡高度
@@ -38,11 +38,31 @@ enum Stage {
     Error,
 }
 
+/// 支持导入的文件扩展名（小写）
+pub const SUPPORTED_EXTENSIONS: [&str; 2] = ["flac", "mp3"];
+
 /// 当前文件信息（无论是否分析完成都要展示文件名 / 大小）
 struct LoadedFile {
     name: String,
     path: PathBuf,
     size_bytes: u64,
+}
+
+impl LoadedFile {
+    /// 展示用的容器格式标签：`.flac` → FLAC，`.mp3` → MP3
+    fn format_label(&self) -> String {
+        self.path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_uppercase())
+            .unwrap_or_else(|| "音频".to_string())
+    }
+}
+
+/// 扩展名是否受支持（大小写不敏感）
+fn is_supported_extension(ext: &str) -> bool {
+    let lower = ext.to_ascii_lowercase();
+    SUPPORTED_EXTENSIONS.contains(&lower.as_str())
 }
 
 pub struct FlacBpmApp {
@@ -62,6 +82,8 @@ pub struct FlacBpmApp {
     error: Option<String>,
     audio: AudioEngine,
     view: WaveViewState,
+    /// 手工测速（右键点击波形打点，两点间隔 = 一个节拍）
+    tap: TapTempo,
     /// 状态栏右侧的临时提示（例如点击节拍后的信息）
     status_extra: Option<String>,
     /// 齿轮设置面板开关
@@ -97,6 +119,7 @@ impl FlacBpmApp {
             error: None,
             audio: AudioEngine::default(),
             view: WaveViewState::default(),
+            tap: TapTempo::default(),
             status_extra: None,
             settings_open: false,
         }
@@ -124,8 +147,10 @@ impl FlacBpmApp {
             .and_then(|e| e.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if ext != "flac" {
-            self.fail(format!("暂不支持的文件类型 .{ext}，本工具只处理 .flac"));
+        if !is_supported_extension(&ext) {
+            self.fail(format!(
+                "暂不支持的文件类型 .{ext}，本工具只处理 .flac / .mp3"
+            ));
             return;
         }
 
@@ -140,6 +165,7 @@ impl FlacBpmApp {
         self.error = None;
         self.status_extra = None;
         self.view = WaveViewState::default();
+        self.tap.clear();
         self.file = Some(LoadedFile {
             name,
             path,
@@ -175,6 +201,7 @@ impl FlacBpmApp {
         self.status_extra = None;
         self.audio.stop();
         self.view = WaveViewState::default();
+        self.tap.clear();
         self.handle = Some(crate::analysis::start_analysis(path));
         self.progress = 0.0;
         self.progress_shown = 0.0;
@@ -185,7 +212,9 @@ impl FlacBpmApp {
 
     fn pick_file(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("FLAC 音频", &["flac"])
+            .add_filter("音频文件 (FLAC / MP3)", &SUPPORTED_EXTENSIONS)
+            .add_filter("FLAC 无损音频", &["flac"])
+            .add_filter("MP3 音频", &["mp3"])
             .pick_file()
         {
             self.open_file(path);
@@ -306,7 +335,33 @@ impl eframe::App for FlacBpmApp {
     }
 }
 
+/// 是否应该执行自动跟随：开关打开、正在播放、且不在手动平移冷却期内
+fn follow_allowed(follow_enabled: bool, playing: bool, now: f64, hold_until: f64) -> bool {
+    follow_enabled && playing && now >= hold_until
+}
+
 impl FlacBpmApp {
+    /// 播放中按需把视图滚动到播放头。
+    ///
+    /// 三个前提：开关打开、正在播放、不在「手动平移冷却期」内。
+    /// 冷却机制是为了避免用户滚开去看别的段落时，视图每帧都被拽回播放头。
+    fn auto_follow(&mut self, now: f64) {
+        if !follow_allowed(
+            self.view.follow_playhead,
+            self.audio.is_playing(),
+            now,
+            self.view.follow_hold_until,
+        ) {
+            return;
+        }
+        let Some(result) = self.result.as_ref() else {
+            return;
+        };
+        let duration = result.duration;
+        let pos = self.audio.position() as f32;
+        self.view.follow(duration, pos);
+    }
+
     /// 每帧逻辑（与 eframe 解耦，方便离屏冒烟测试）
     pub fn frame_update(&mut self, ctx: &egui::Context) {
         Self::configure(ctx);
@@ -318,6 +373,7 @@ impl FlacBpmApp {
         self.poll();
         self.tick_progress();
         self.audio.tick();
+        self.auto_follow(ctx.input(|i| i.time));
         self.handle_shortcuts(ctx);
 
         // 文件拖放（单文件模式：只取第一个文件）
@@ -396,7 +452,7 @@ impl FlacBpmApp {
             ui.horizontal_centered(|ui| {
                     draw_app_icon(ui, 24.0);
                     ui.add_space(10.0);
-                    ui.label(RichText::new("FLAC 节拍分析器").size(15.0).color(TEXT));
+                    ui.label(RichText::new("音频节拍分析器").size(15.0).color(TEXT));
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let gear = egui::Button::new(RichText::new("⚙").size(15.0).color(TEXT_SUB))
@@ -409,7 +465,7 @@ impl FlacBpmApp {
                         }
                         ui.add_space(8.0);
                         let import = egui::Button::new(
-                            RichText::new("导入 FLAC").size(13.0).color(Color32::WHITE),
+                            RichText::new("导入音频").size(13.0).color(Color32::WHITE),
                         )
                         .fill(PRIMARY)
                         .corner_radius(CONTROL_RADIUS)
@@ -425,7 +481,7 @@ impl FlacBpmApp {
     // ---------------- 状态栏 ----------------
     fn render_status_bar(&mut self, ui: &mut Ui) {
         let mut text = match self.stage {
-            Stage::Empty => "就绪 · 等待导入 FLAC 文件".to_string(),
+            Stage::Empty => "就绪 · 等待导入音频文件（FLAC / MP3）".to_string(),
             Stage::Loading => "正在打开文件…".to_string(),
             Stage::Analyzing => format!(
                 "分析中 · {} {:.0}%",
@@ -470,8 +526,9 @@ impl FlacBpmApp {
             Stage::Error => self.render_error_state(ui, content),
             Stage::Loading | Stage::Analyzing => self.render_busy(ui, content),
             Stage::Ready => {
-                let taken = self.result.take();
-                match &taken {
+                // 取出 result 以避免与 &mut self 的借用冲突（手工采用 BPM 时要就地改写它）
+                let mut taken = self.result.take();
+                match taken.as_mut() {
                     Some(r) => self.render_result(ui, content, r),
                     None => self.render_empty_state(ui, content),
                 }
@@ -493,13 +550,13 @@ impl FlacBpmApp {
                     draw_wave_badge(ui, 72.0);
                     ui.add_space(20.0);
                     ui.label(
-                        RichText::new("拖入一个 FLAC 文件开始分析")
+                        RichText::new("拖入一个音频文件开始分析")
                             .size(17.0)
                             .color(TEXT),
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("支持 .flac · 单次分析一个文件")
+                        RichText::new("支持 .flac / .mp3 · 单次分析一个文件")
                             .size(12.5)
                             .color(TEXT_SUB),
                     );
@@ -594,7 +651,7 @@ impl FlacBpmApp {
     }
 
     /// 结果视图：文件卡 + 指标行 + 波形卡
-    fn render_result(&mut self, ui: &mut Ui, content: Rect, result: &AnalysisResult) {
+    fn render_result(&mut self, ui: &mut Ui, content: Rect, result: &mut AnalysisResult) {
         let w = content.width();
 
         // ---- 1. 文件信息卡 ----
@@ -613,7 +670,7 @@ impl FlacBpmApp {
             );
             ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
                 card_frame().show(ui, |ui| match i {
-                    0 => metric_bpm_card(ui, result),
+                    0 => metric_bpm_card(ui, result, self.tap.applied.is_some()),
                     1 => metric_simple_card(ui, "拍号", "4 / 4"),
                     2 => metric_simple_card(
                         ui,
@@ -630,15 +687,25 @@ impl FlacBpmApp {
         let wave_h = (content.bottom() - wave_top).max(MIN_WAVE_H);
         let wave_rect = Rect::from_min_size(Pos2::new(content.left(), wave_top), Vec2::new(w, wave_h));
 
-        // 借用冲突处理：临时取出 audio / view，绘制完再放回
+        // 借用冲突处理：临时取出 audio / view / tap，绘制完再放回
         let mut audio = std::mem::take(&mut self.audio);
         let mut view = self.view;
+        let mut tap = std::mem::take(&mut self.tap);
         let mut info = self.status_extra.clone();
         ui.scope_builder(UiBuilder::new().max_rect(wave_rect), |ui| {
-            show_waveform_card(ui, wave_rect.size(), result, &mut audio, &mut view, &mut info);
+            show_waveform_card(
+                ui,
+                wave_rect.size(),
+                result,
+                &mut audio,
+                &mut view,
+                &mut tap,
+                &mut info,
+            );
         });
         self.audio = audio;
         self.view = view;
+        self.tap = tap;
         self.status_extra = info;
     }
 
@@ -659,15 +726,29 @@ impl FlacBpmApp {
                         let size = self.file.as_ref().map(|f| f.size_bytes).unwrap_or(0);
                         ui.label(RichText::new(name).size(17.0).color(TEXT).strong());
                         ui.add_space(5.0);
+                        // 容器格式按实际扩展名显示（FLAC / MP3），不要写死
+                        let fmt = self
+                            .file
+                            .as_ref()
+                            .map(|f| f.format_label())
+                            .unwrap_or_else(|| "音频".to_string());
                         let meta = match result {
-                            Some(r) => format!(
-                                "{} · {} Hz / {} bit · FLAC · {} · {} 声道",
-                                format_timecode(r.duration),
-                                r.sample_rate,
-                                r.bits_per_sample,
-                                human_size(size),
-                                r.channels
-                            ),
+                            Some(r) => {
+                                // 有损格式（MP3）没有「位深」这个概念，显示 16 bit 会误导
+                                let quality = if fmt == "MP3" {
+                                    format!("{} Hz", r.sample_rate)
+                                } else {
+                                    format!("{} Hz / {} bit", r.sample_rate, r.bits_per_sample)
+                                };
+                                format!(
+                                    "{} · {} · {} · {} · {} 声道",
+                                    format_timecode(r.duration),
+                                    quality,
+                                    fmt,
+                                    human_size(size),
+                                    r.channels
+                                )
+                            }
                             None => format!("正在读取文件信息 · {}", human_size(size)),
                         };
                         ui.label(RichText::new(meta).size(12.5).color(TEXT_SUB));
@@ -719,7 +800,7 @@ impl FlacBpmApp {
                     .color(TEXT_SUB),
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("FLAC 节拍分析器 v0.1.0").size(12.0).color(TEXT_SUB));
+                ui.label(RichText::new("音频节拍分析器 v0.1.0").size(12.0).color(TEXT_SUB));
             });
     }
 }
@@ -779,24 +860,34 @@ fn draw_wave_badge(ui: &mut Ui, size: f32) {
 }
 
 /// ① BPM 指标卡：大号橙色数字 + 置信度徽章
-fn metric_bpm_card(ui: &mut Ui, result: &AnalysisResult) {
+fn metric_bpm_card(ui: &mut Ui, result: &AnalysisResult, manual: bool) {
     ui.vertical(|ui| {
         ui.label(RichText::new("每分钟节拍数").size(12.5).color(TEXT_SUB));
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{:.1}", result.bpm)).size(34.0).color(PRIMARY));
             ui.add_space(8.0);
-            let pct = (result.confidence * 100.0).round() as i32;
+            // 手工值没有「置信度」可言，改标注来源，避免把人工测量伪装成算法置信度
+            let (bg, fg, text) = if manual {
+                (
+                    Color32::from_rgb(0xFD, 0xF1, 0xEA),
+                    Color32::from_rgb(0xC0, 0x56, 0x2F),
+                    "手工测量".to_string(),
+                )
+            } else {
+                let pct = (result.confidence * 100.0).round() as i32;
+                (
+                    BADGE_GREEN_BG,
+                    BADGE_GREEN_FG,
+                    format!("置信度 {pct}%"),
+                )
+            };
             egui::Frame::NONE
-                .fill(BADGE_GREEN_BG)
+                .fill(bg)
                 .corner_radius(10.0)
                 .inner_margin(Margin::symmetric(8, 3))
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("置信度 {pct}%"))
-                            .size(11.5)
-                            .color(BADGE_GREEN_FG),
-                    );
+                    ui.label(RichText::new(text).size(11.5).color(fg));
                 });
         });
         ui.add_space(4.0);
@@ -862,7 +953,7 @@ mod smoke_tests {
             size_bytes: 28_000_000,
         });
         app.result = Some(result);
-        app.view = crate::ui::waveform::WaveViewState { zoom, start_sec: start };
+        app.view = crate::ui::waveform::WaveViewState { zoom, start_sec: start, ..Default::default() };
         app
     }
 
@@ -907,6 +998,176 @@ mod smoke_tests {
         })
     }
 
+    /// 取出本帧「指针附近」的文本图元。
+    ///
+    /// 必须限定在指针附近：播放控制行本身就有时间码文本，不加位置过滤会得到假阳性。
+    fn texts_near(shapes: &[egui::epaint::ClippedShape], pointer: egui::Pos2, max_dy: f32) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(ts) if (ts.pos.y - pointer.y).abs() < max_dy => {
+                    Some(ts.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 是否形如时间码 `m:ss.mmm` / `mm:ss.mmm`
+    fn is_timecode(s: &str) -> bool {
+        let Some((m, rest)) = s.split_once(':') else {
+            return false;
+        };
+        let Some((sec, ms)) = rest.split_once('.') else {
+            return false;
+        };
+        !m.is_empty()
+            && m.chars().all(|c| c.is_ascii_digit())
+            && sec.len() == 2
+            && sec.chars().all(|c| c.is_ascii_digit())
+            && ms.len() == 3
+            && ms.chars().all(|c| c.is_ascii_digit())
+    }
+
+    /// 在指定位置右键点击一次（press + release 两帧）
+    fn right_click_at(app: &mut FlacBpmApp, ctx: &egui::Context, pos: egui::Pos2) {
+        let m = egui::Modifiers::NONE;
+        let ev = |pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: m,
+                },
+            ]
+        };
+        frame_raw(app, ctx, m, ev(true));
+        frame_raw(app, ctx, m, ev(false));
+    }
+
+    /// 右键点击波形两次 = 手工测速：应记录打点、算出 BPM，并给出「采用」按钮
+    #[test]
+    fn 右键点击可手工测速() {
+        let ctx = egui::Context::default();
+        // 20 倍放大 → 可视 12s / 约 1368px，即约 114px/s
+        let mut app = ready_app(fake_result(), 20.0, 0.0);
+        let y = 500.0;
+        frame(&mut app, &ctx, None); // 先建一帧，让舞台 widget 完成首次布局
+
+        right_click_at(&mut app, &ctx, egui::Pos2::new(600.0, y));
+        assert_eq!(app.tap.taps().len(), 1, "第一次右键应记录一个打点");
+        assert_eq!(app.tap.bpm(), None, "只点一次还算不出 BPM");
+
+        // 右移 56px ≈ 0.49s ≈ 122 BPM
+        right_click_at(&mut app, &ctx, egui::Pos2::new(656.0, y));
+        assert_eq!(app.tap.taps().len(), 2, "第二次右键应记录第二个打点");
+        let bpm = app.tap.bpm().expect("两次打点后应能算出 BPM");
+        assert!(
+            (bpm - 120.0).abs() < 10.0,
+            "两次点击相隔约 0.5s，应约 120 BPM，实际 {bpm:.1}"
+        );
+
+        let shapes = frame(&mut app, &ctx, Some(egui::Pos2::new(700.0, y)));
+        assert!(
+            has_text(&shapes, "采用此 BPM"),
+            "测出 BPM 后应出现「采用此 BPM」按钮"
+        );
+        assert!(has_text(&shapes, "手工"), "应显示手工测速结果文本");
+    }
+
+    /// 左键点击仍然是定位播放头，不会被打点逻辑吃掉
+    #[test]
+    fn 左键点击仍然定位播放头() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 20.0, 0.0);
+        let pos = egui::Pos2::new(600.0, 500.0);
+        frame(&mut app, &ctx, None);
+        let m = egui::Modifiers::NONE;
+        for pressed in [true, false] {
+            frame_raw(
+                &mut app,
+                &ctx,
+                m,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: m,
+                    },
+                ],
+            );
+        }
+        assert!(app.tap.taps().is_empty(), "左键点击不应产生打点");
+        // 离屏环境没有载入 PCM，audio.position() 会被 duration=0 钳住，
+        // 因此改为断言状态栏提示（它由同一条定位分支写入）
+        let msg = app.status_extra.clone().unwrap_or_default();
+        assert!(
+            msg.contains("播放头定位于"),
+            "左键点击应定位播放头，实际状态栏：{msg:?}"
+        );
+    }
+
+    /// 自动跟随的三个前提（开关 / 正在播放 / 不在手动冷却期）
+    #[test]
+    fn 自动跟随的三个前提() {
+        assert!(follow_allowed(true, true, 10.0, 9.0), "条件齐备时应跟随");
+        assert!(!follow_allowed(false, true, 10.0, 9.0), "开关关闭不应跟随");
+        assert!(!follow_allowed(true, false, 10.0, 9.0), "未播放不应跟随");
+        assert!(
+            !follow_allowed(true, true, 10.0, 12.0),
+            "手动平移冷却期内不应跟随"
+        );
+        assert!(
+            follow_allowed(true, true, 12.0, 12.0),
+            "冷却结束后应恢复跟随"
+        );
+    }
+
+    /// 播放控制行应有「跟随播放头」开关，默认开启
+    #[test]
+    fn 跟随播放头开关存在且默认开启() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 4.0, 0.0);
+        let shapes = frame(&mut app, &ctx, None);
+        assert!(
+            has_text(&shapes, "跟随播放头"),
+            "播放控制行应有「跟随播放头」开关"
+        );
+        assert!(
+            has_text(&shapes, "跟随播放头 · 开"),
+            "默认应为开启状态"
+        );
+    }
+
+    /// 光标在波形区任意位置移动都应实时显示时间码（不只在节拍线上）
+    #[test]
+    fn 光标移动实时显示时间码() {
+        let ctx = egui::Context::default();
+        // 放大到 20 倍：节拍线间距足够大，能明确区分「命中」与「未命中」
+        let mut app = ready_app(fake_result(), 20.0, 0.0);
+        let mut plain_hits = 0;
+        let mut x = 40.0;
+        while x <= 1400.0 {
+            let p = egui::Pos2::new(x, 500.0);
+            let shapes = frame(&mut app, &ctx, Some(p));
+            let ts = texts_near(&shapes, p, 120.0);
+            let on_beat = ts.iter().any(|t| t.contains("节拍 #"));
+            let has_time = ts.iter().any(|t| is_timecode(t));
+            if !on_beat && has_time {
+                plain_hits += 1;
+            }
+            x += 7.0;
+        }
+        assert!(
+            plain_hits > 0,
+            "光标未落在节拍线上时也应显示时间码提示（实际未出现）"
+        );
+    }
+
     /// 离屏渲染若干帧，覆盖全曲视图 / 放大视图 / 滚到曲末 / 指针扫过舞台
     #[test]
     fn 界面渲染不panic且悬停路径可执行() {
@@ -925,6 +1186,31 @@ mod smoke_tests {
                 y += 40.0;
             }
         }
+    }
+
+    /// 扩展名白名单：接受 flac / mp3（大小写不敏感），拒绝其他格式
+    #[test]
+    fn 扩展名白名单包含mp3() {
+        for ext in ["flac", "FLAC", "mp3", "MP3", "Mp3"] {
+            assert!(is_supported_extension(ext), "{ext} 应被接受");
+        }
+        for ext in ["wav", "m4a", "ogg", "flac.part", ""] {
+            assert!(!is_supported_extension(ext), "{ext} 不应被接受");
+        }
+    }
+
+    /// 元数据行按实际扩展名显示容器格式，不能写死 FLAC
+    #[test]
+    fn 格式标签随扩展名变化() {
+        let mk = |name: &str| LoadedFile {
+            name: name.to_string(),
+            path: std::path::PathBuf::from(name),
+            size_bytes: 1024,
+        };
+        assert_eq!(mk("a.flac").format_label(), "FLAC");
+        assert_eq!(mk("b.mp3").format_label(), "MP3");
+        assert_eq!(mk("c.MP3").format_label(), "MP3");
+        assert_eq!(mk("no_ext").format_label(), "音频");
     }
 
     /// 空状态同样要能渲染

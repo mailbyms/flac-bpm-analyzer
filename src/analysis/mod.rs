@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use types::{AnalysisError, AnalysisEvent, AnalysisResult};
 
-use self::decode::{decode_flac, DecodedAudio};
+use self::decode::{decode_audio, DecodedAudio};
 use self::dsp::{
     compute_waveform_peaks, estimate_tempo, generate_beats, onset_envelope, WAVEFORM_BUCKETS,
 };
@@ -89,7 +89,7 @@ fn run_pipeline(
     path: &PathBuf,
     tx: &std::sync::mpsc::Sender<AnalysisEvent>,
 ) -> Result<PipelineOutput, AnalysisError> {
-    send(tx, 0.02, "正在打开 FLAC 文件…");
+    send(tx, 0.02, "正在打开音频文件…");
 
     // ---- 1) 解码 + 混音 + 降采样 ----
     // 阶段权重按真实耗时分配：解码+降采样是最重的一段，给它 3%~58%
@@ -99,8 +99,8 @@ fn run_pipeline(
         mono,
         analysis_sr,
         playback,
-    } = decode_flac(path, |p| {
-        // decode_flac 内部约定：解码循环 0~0.85，降采样 0.85~1.0
+    } = decode_audio(path, |p| {
+        // decode_audio 内部约定：解码循环 0~0.85，降采样 0.85~1.0
         let mapped = 0.03 + p * 0.55;
         let label = if p < 0.86 {
             "正在解码音频…"
