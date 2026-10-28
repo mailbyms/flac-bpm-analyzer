@@ -148,14 +148,42 @@ cargo build --release --no-default-features --target x86_64-unknown-linux-musl
 ## 批量核对标签 BPM
 
 `tools/check_bpm_vs_tags.sh` 拿一个目录，把每个 `.flac` 的**标签 BPM**（metaflac 读取）
-和**本工具算出的 BPM** 并排放，输出对比表 + 统计。适合验证算法在你自己的曲库上准不准。
+和**本工具算出的 BPM** 并排放，默认输出 **Markdown 表格**（可直接贴进 issue / PR / README），
+另可切换成终端对齐表格或 CSV。适合验证算法在你自己的曲库上准不准。
 
 ```bash
-tools/check_bpm_vs_tags.sh "D:/Music"                # 递归扫整个目录
-tools/check_bpm_vs_tags.sh "D:/Music" --no-recursive # 只看本层
-tools/check_bpm_vs_tags.sh "D:/Music" --csv > out.csv # 导出 CSV 做二次统计
-tools/check_bpm_vs_tags.sh "D:/Music" -t 0.5         # 收紧「一致」容差到 0.5 BPM
+tools/check_bpm_vs_tags.sh "D:/Music"                  # 递归扫描，输出 Markdown 表格
+tools/check_bpm_vs_tags.sh "D:/Music" > report.md      # 存成 .md，贴到 GitHub 直接渲染
+tools/check_bpm_vs_tags.sh "D:/Music" --table          # 终端对齐表格（带颜色）
+tools/check_bpm_vs_tags.sh "D:/Music" --no-recursive   # 只看本层
+tools/check_bpm_vs_tags.sh "D:/Music" --csv > out.csv  # 导出 CSV 做二次统计
+tools/check_bpm_vs_tags.sh "D:/Music" -t 0.5           # 收紧「一致」容差到 0.5 BPM
 ```
+
+输出形如（上面是 Markdown 源码，贴进 GitHub 会渲染成表格）：
+
+```markdown
+**目录**：`/data/music`
+
+**样本**：3 个 .flac（含子目录）
+
+| 文件 | 标签BPM | 测得BPM | 差值 | 结论 | 置信度 |
+| :--- | ---: | ---: | ---: | :---: | ---: |
+| `Creep.flac` | 125 | 124.99 | -0.01 | 一致 | 50% |
+| `2X 半速.flac` | 62.5 | 124.99 | +62.49 | 翻倍 | 50% |
+| `无标签.flac` | - | 119.98 | - | 无标签 | 86% |
+
+**小结**：共 3 个文件，2 个有可用 BPM 标签
+
+- 一致：1
+- 翻倍：1（测得是标签 2 倍，多为半速误判）
+- 无标签：1
+- 平均绝对误差：0.01 BPM（容差 1.0，统计 1 个同倍频样本，不含翻倍/减半）
+- 最大偏差：0.01 BPM（`Creep.flac`）
+```
+
+表格单元格里文件名一律包了反引号，`|` 会转义成 `\|`（否则会把表格切断），
+文件名里的 `*`、`_` 也不会被渲染成强调。
 
 标签依次尝试 `BPM` → `TBPM` → `TEMPO`（不同打标软件习惯不同），值里带小数或单位
 （`124.00`、`124 BPM`）都能识别。结论分六类：
@@ -196,7 +224,7 @@ tools/check_bpm_vs_tags.sh "D:/Music" -t 0.5         # 收紧「一致」容差�
 | `assets/icon_256.rgba` | 窗口/任务栏图标，原始 RGBA，运行时 `include_bytes!` 直接用（免解码依赖） |
 | `tools/gen_icon.py` | 图标生成脚本（纯标准库：超采样渲染 + PNG/ICO 手写编码） |
 | `tools/check_icon.py` | 验证 exe 是否真的嵌入了图标（解析 PE 资源表） |
-| `tools/check_bpm_vs_tags.sh` | 批量比对「标签 BPM」与「算出的 BPM」，输出对比表 / CSV |
+| `tools/check_bpm_vs_tags.sh` | 批量比对「标签 BPM」与「算出的 BPM」，输出 Markdown 表格 / 终端表格 / CSV |
 | `tools/diag_*.py` | 测速链路的诊断脚本（复现管线、包络对照、合成信号对照），不影响编译 |
 
 ## 应用图标

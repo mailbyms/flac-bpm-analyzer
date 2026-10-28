@@ -6,10 +6,14 @@
 #
 # 选项：
 #   --no-recursive     只看该目录本身，不进子目录（默认递归）
-#   --csv              输出 CSV 而非表格（便于丢进 Excel / 二次统计）
+#   --table            输出终端对齐表格（带颜色），替代默认的 Markdown 表格
+#   --csv              输出 CSV（便于丢进 Excel / 二次统计）
 #   -t, --tolerance N  判定「一致」的容差，单位 BPM，默认 1.0
 #   -e, --exe PATH     指定分析器可执行文件（默认自动找 target/release）
 #   -h, --help         显示帮助
+#
+# 默认输出是 Markdown 表格（直接可贴 GitHub / issue / PR 评论）：
+#   tools/check_bpm_vs_tags.sh "D:/Music" > report.md
 #
 # 依赖：
 #   metaflac          读 Vorbis Comment 里的 BPM / TBPM / TEMPO 标签
@@ -30,7 +34,7 @@ set -uo pipefail
 # ---------- 参数 ----------
 DIR=""
 RECURSIVE=1
-CSV=0
+FMT="md"        # md | table | csv
 TOL="1.0"
 EXE_ARG=""
 
@@ -43,10 +47,16 @@ check_bpm_vs_tags.sh —— 批量比对「FLAC 标签里的 BPM」与「本工�
 
 选项：
   --no-recursive     只看该目录本身，不进子目录（默认递归）
-  --csv              输出 CSV 而非表格（便于丢进 Excel / 二次统计）
+  --table            输出终端对齐表格（带颜色），替代默认的 Markdown 表格
+  --csv              输出 CSV（便于丢进 Excel / 二次统计）
   -t, --tolerance N  判定「一致」的容差，单位 BPM，默认 1.0
   -e, --exe PATH     指定分析器可执行文件（默认自动找 target/release）
   -h, --help         显示帮助
+
+输出格式：
+  默认输出 Markdown 表格，可直接贴进 GitHub issue / PR / README：
+    tools/check_bpm_vs_tags.sh "D:/Music" > report.md
+  想看终端里的对齐表格（带颜色）用 --table，想二次统计用 --csv。
 
 依赖：
   metaflac           读 Vorbis Comment 里的 BPM / TBPM / TEMPO 标签
@@ -68,7 +78,9 @@ USAGE
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-recursive) RECURSIVE=0; shift ;;
-        --csv)          CSV=1; shift ;;
+        --csv)          FMT="csv"; shift ;;
+        --md|--markdown) FMT="md"; shift ;;
+        --table)        FMT="table"; shift ;;
         -t|--tolerance) TOL="${2:-}"; shift 2 ;;
         -e|--exe)       EXE_ARG="${2:-}"; shift 2 ;;
         -h|--help)      usage 0 ;;
@@ -237,7 +249,7 @@ for f in "${FILES[@]}"; do
     i=$(( i + 1 ))
     rel="${f#$ABS_DIR/}"; rel="${rel#$DIR/}"
 
-    if [ "$CSV" -eq 0 ] && [ -t 2 ]; then
+    if [ "$FMT" != "csv" ] && [ -t 2 ]; then
         printf '\r\033[K  分析中 [%d/%d] %s' "$i" "$TOTAL" "$(truncate_tail "$rel" 60)" >&2
     fi
 
@@ -271,7 +283,7 @@ for f in "${FILES[@]}"; do
         [ "$tagkey" != "BPM" ] && NOTE+=( "$rel · 标签取自 $tagkey" )
     fi
 done
-[ "$CSV" -eq 0 ] && [ -t 2 ] && printf '\r\033[K' >&2
+[ "$FMT" != "csv" ] && [ -t 2 ] && printf '\r\033[K' >&2
 
 ELAPSED_MS=$(( ($(date +%s%N) - START_TS) / 1000000 ))
 
@@ -304,7 +316,19 @@ mean_abs=0
 [ "$n_cmp" -gt 0 ] && mean_abs=$(awk -v s="$sum_abs" -v n="$n_cmp" 'BEGIN { printf "%.2f", s/n }')
 
 # ---------- 输出 ----------
-if [ "$CSV" -eq 1 ]; then
+# 差值带符号，便于一眼看出方向；三种格式共用
+signed_diff() {
+    local d="$1"
+    case "$d" in
+        -) ;;
+        -*) ;;
+        0.00) ;;
+        *) d="+$d" ;;
+    esac
+    printf '%s' "$d"
+}
+
+if [ "$FMT" = "csv" ]; then
     # 文件名可能有逗号/引号，按 RFC4180 加引号转义，否则 Excel 会错列
     csv_q() {
         local s="$1"
@@ -323,6 +347,71 @@ if [ "$CSV" -eq 1 ]; then
     exit 0
 fi
 
+# ---------- Markdown 表格（默认） ----------
+if [ "$FMT" = "md" ]; then
+    # 表格单元格里 `|` 会断列、换行会断行，必须先转义；
+    # 文件名再包一层反引号，免得文件名里的 * _ 被渲染成强调
+    md_esc() {
+        local s="$1"
+        s="${s//$'\r'/ }"
+        s="${s//$'\n'/ }"
+        s="${s//$'\t'/ }"
+        printf '%s' "${s//|/\\|}"
+    }
+    md_code() {
+        local s
+        s=$(md_esc "$1")
+        case "$s" in
+            *'`'*) printf '%s' "$s" ;;      # 自带反引号就不包裹，免得代码段配不上对
+            *)     printf '`%s`' "$s" ;;
+        esac
+    }
+
+    printf '**目录**：%s\n\n' "$(md_code "$ABS_DIR")"
+    printf '**样本**：%d 个 .flac（%s）\n\n' \
+        "$TOTAL" "$([ "$RECURSIVE" -eq 0 ] && echo '仅本层' || echo '含子目录')"
+
+    printf '| 文件 | 标签BPM | 测得BPM | 差值 | 结论 | 置信度 |\n'
+    printf '| :--- | ---: | ---: | ---: | :---: | ---: |\n'
+    for idx in "${!REL[@]}"; do
+        printf '| %s | %s | %s | %s | %s | %s |\n' \
+            "$(md_code "${REL[$idx]}")" \
+            "${TAG[$idx]}" \
+            "${MEA[$idx]}" \
+            "$(signed_diff "${DIFF[$idx]}")" \
+            "${VERD[$idx]}" \
+            "${CONF[$idx]}"
+    done
+
+    printf '\n**小结**：共 %d 个文件，%d 个有可用 BPM 标签\n\n' "$TOTAL" "$n_tag"
+    [ "$n_ok"   -gt 0 ] && printf -- '- 一致：%d\n' "$n_ok"
+    [ "$n_dbl"  -gt 0 ] && printf -- '- 翻倍：%d（测得是标签 2 倍，多为半速误判）\n' "$n_dbl"
+    [ "$n_half" -gt 0 ] && printf -- '- 减半：%d（测得是标签一半）\n' "$n_half"
+    [ "$n_off"  -gt 0 ] && printf -- '- 偏差：%d\n' "$n_off"
+    [ "$n_notag" -gt 0 ] && printf -- '- 无标签：%d\n' "$n_notag"
+    [ "$n_bad"  -gt 0 ] && printf -- '- 异常：%d\n' "$n_bad"
+
+    if [ "$n_cmp" -gt 0 ]; then
+        printf -- '- 平均绝对误差：%s BPM（容差 %s，统计 %d 个同倍频样本，不含翻倍/减半）\n' \
+            "$mean_abs" "$TOL" "$n_cmp"
+        printf -- '- 最大偏差：%s BPM（%s）\n' "$worst_abs" "$(md_code "$worst_name")"
+        if awk -v m="$mean_abs" -v t="$TOL" 'BEGIN { exit !(m > t) }'; then
+            printf '\n> 平均误差超出容差，建议抽查上表中结论非「一致」的文件。\n'
+        fi
+    elif [ "$n_dbl" -gt 0 ] || [ "$n_half" -gt 0 ]; then
+        printf '\n> 所有可用样本都是倍频关系，误差统计无意义（见上方翻倍/减半计数）。\n'
+    fi
+
+    printf '\n耗时：%d.%03d s\n' "$(( ELAPSED_MS / 1000 ))" "$(( ELAPSED_MS % 1000 ))"
+
+    if [ "${#NOTE[@]}" -gt 0 ]; then
+        printf '\n**附注**\n\n'
+        for n in "${NOTE[@]}"; do printf -- '- %s\n' "$(md_esc "$n")"; done
+    fi
+    exit 0
+fi
+
+# ---------- 终端对齐表格（--table） ----------
 # 列宽
 W_PATH=4; W_TAG=8; W_MEA=8; W_DIFF=8; W_VERD=6; W_CONF=7
 PATH_CAP=52
@@ -359,13 +448,7 @@ for idx in "${!REL[@]}"; do
         无标签) color="$C_DIM" ;;
     esac
     # 差值带符号，便于一眼看出方向
-    d="${DIFF[$idx]}"
-    case "$d" in
-        -) ;;
-        -*) ;;
-        0.00) ;;
-        *) d="+$d" ;;
-    esac
+    d=$(signed_diff "${DIFF[$idx]}")
     printf '%s  %s  %s  %s  %s  %s\n' \
         "$(pad_r "$(truncate_tail "${REL[$idx]}" "$PATH_CAP")" "$W_PATH")" \
         "$(pad_l "${TAG[$idx]}" "$W_TAG")" \
