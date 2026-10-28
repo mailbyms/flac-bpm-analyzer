@@ -23,6 +23,12 @@ fn main() -> Result<(), eframe::Error> {
             return Ok(());
         }
     }
+    if let Some(pos) = args.iter().position(|a| a == "--playtest") {
+        if let Some(file) = args.get(pos + 1) {
+            selftest::playtest(std::path::Path::new(file));
+            return Ok(());
+        }
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -122,7 +122,9 @@ impl AudioEngine {
             return true;
         }
         match DeviceSinkBuilder::open_default_sink() {
-            Ok(sink) => {
+            Ok(mut sink) => {
+                // 程序退出时 rodio 会打一行 "Dropping DeviceSink" 提示，此处属于正常释放
+                sink.log_on_drop(false);
                 let player = Player::connect_new(sink.mixer());
                 self.player = Some(player);
                 self._sink = Some(sink);
@@ -177,6 +179,10 @@ impl AudioEngine {
             channels: chan_nz,
             sample_rate: sr_nz,
         });
+        // 关键：rodio 的 `Player::clear()` 内部最后会调用 `self.pause()`（见 player.rs），
+        // 而 `append()` 不会自动恢复播放。若不显式 play()，source 只是入队却一直处于
+        // 暂停状态 —— 表现就是「点了播放、界面显示 playing，但既没声音播放头也不走」。
+        player.play();
         self.base_offset = self.position;
         self.dirty = false;
         true

@@ -754,6 +754,61 @@ fn draw_playhead(
     painter.circle_filled(Pos2::new(x, cy), 3.0, PRIMARY.linear_multiply(0.6));
 }
 
+/// 播放/暂停按钮：图标用手绘图形而非字符字形
+///
+/// 用字符（❚❚ / ▶）时形状完全取决于字体，在部分字体下会渲染成两个小方框线框，
+/// 既不统一也不好看。这里改成市面播放器的通用画法：
+///   * 播放 = 实心三角形
+///   * 暂停 = 两根实心圆角竖条
+fn play_pause_button(ui: &mut Ui, size: f32, playing: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let painter = ui.painter();
+    // hover 时底色略提亮，保留可点击的反馈
+    let bg = if resp.hovered() {
+        PRIMARY.gamma_multiply(1.12)
+    } else {
+        PRIMARY
+    };
+    painter.circle_filled(rect.center(), size / 2.0, bg);
+    for shape in play_pause_shapes(rect.center(), playing) {
+        painter.add(shape);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+/// 生成播放/暂停图标的形状（纯函数，便于单元测试）
+fn play_pause_shapes(c: Pos2, playing: bool) -> Vec<Shape> {
+    if playing {
+        // 暂停：两根竖条，细长且带小圆角，视觉上「高瘦」而非方块
+        let bar_w = 4.0;
+        let bar_h = 18.0;
+        let gap = 4.0;
+        let top = c.y - bar_h / 2.0;
+        let bar = |x: f32| {
+            Shape::Rect(egui::epaint::RectShape::filled(
+                Rect::from_min_size(Pos2::new(x, top), Vec2::new(bar_w, bar_h)),
+                1.5,
+                Color32::WHITE,
+            ))
+        };
+        vec![bar(c.x - gap / 2.0 - bar_w), bar(c.x + gap / 2.0)]
+    } else {
+        // 播放：实心三角形；重心偏左，故整体右移 1px 让视觉居中
+        let h = 18.0;
+        let w = 16.0;
+        let cx = c.x + 1.0;
+        vec![Shape::convex_polygon(
+            vec![
+                Pos2::new(cx - w / 2.0, c.y - h / 2.0),
+                Pos2::new(cx + w / 2.0, c.y),
+                Pos2::new(cx - w / 2.0, c.y + h / 2.0),
+            ],
+            Color32::WHITE,
+            Stroke::NONE,
+        )]
+    }
+}
+
 /// 播放控制行
 fn draw_transport(
     ui: &mut Ui,
@@ -765,12 +820,7 @@ fn draw_transport(
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
         ui.horizontal_centered(|ui| {
             let size = 44.0;
-            let symbol = if audio.is_playing() { "❚❚" } else { "▶" };
-            let btn = egui::Button::new(RichText::new(symbol).size(16.0).color(Color32::WHITE))
-                .fill(PRIMARY)
-                .corner_radius(size / 2.0)
-                .min_size(Vec2::new(size, size));
-            if ui.add(btn).clicked() {
+            if play_pause_button(ui, size, audio.is_playing()) {
                 audio.toggle();
             }
 
@@ -862,6 +912,50 @@ mod tests {
         let ratio = ((t1 - t0) / duration).clamp(0.0, 1.0);
         let thumb_w = (track_w * ratio).max(SCROLL_THUMB_MIN_W).min(track_w);
         (t0 / duration).clamp(0.0, 1.0) * (track_w - thumb_w).max(0.0)
+    }
+
+    /// 暂停图标必须是两根「实心长竖条」，不能是字体渲染出的线框小方块
+    #[test]
+    fn 暂停图标是两根实心竖条() {
+        let c = Pos2::new(100.0, 100.0);
+        let shapes = play_pause_shapes(c, true);
+        assert_eq!(shapes.len(), 2, "暂停应由两根竖条组成");
+
+        let mut sum_cx = 0.0;
+        for s in &shapes {
+            match s {
+                Shape::Rect(rs) => {
+                    assert_eq!(rs.fill, Color32::WHITE, "竖条应为白色");
+                    assert_eq!(rs.stroke.width, 0.0, "实心填充不应有描边，否则就是线框");
+                    assert!(
+                        rs.rect.height() > rs.rect.width() * 3.0,
+                        "竖条应明显高瘦，实际 {:.1}×{:.1}",
+                        rs.rect.width(),
+                        rs.rect.height()
+                    );
+                    sum_cx += rs.rect.center().x;
+                }
+                _ => panic!("暂停图标应由实心矩形组成"),
+            }
+        }
+        assert!(
+            (sum_cx / 2.0 - c.x).abs() < 0.01,
+            "两根竖条应关于按钮中心对称"
+        );
+    }
+
+    /// 播放图标是实心三角形（与暂停竖条保持同一套视觉语言）
+    #[test]
+    fn 播放图标是实心三角形() {
+        let shapes = play_pause_shapes(Pos2::new(100.0, 100.0), false);
+        assert_eq!(shapes.len(), 1);
+        match &shapes[0] {
+            Shape::Path(ps) => {
+                assert_eq!(ps.fill, Color32::WHITE, "三角形应为白色实心");
+                assert_eq!(ps.points.len(), 3, "三角形应有三个顶点");
+            }
+            _ => panic!("播放图标应是实心三角形"),
+        }
     }
 
     #[test]

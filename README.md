@@ -16,6 +16,8 @@ cargo run --release       # 直接运行
 # 命令行辅助模式（不启动界面，用于验证算法与解码链路）
 cargo run --release -- --selftest               # DSP 自检（合成鼓点，不需要音频文件）
 cargo run --release -- --analyze "某曲目.flac"   # 命令行分析单个 FLAC 并打印结果
+cargo run --release -- --playtest "某曲目.flac"  # 播放自检：解码→播放 2s→检查播放头是否真的推进
+```
 
 # 单元测试 + 离屏界面冒烟测试（不需要窗口/GPU）
 cargo test --release

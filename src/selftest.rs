@@ -179,3 +179,73 @@ pub fn run() -> bool {
     ok
 }
 
+
+/// 播放自检：解码 → 载入播放引擎 → 播放 2 秒 → 检查播放头是否真的推进
+///
+/// 运行：`cargo run --release -- --playtest "某曲目.flac"`
+///
+/// 判定依据：rodio 的 `get_pos()` 统计的是被输出设备**实际消费**的采样数，
+/// 只有真的在出声才会推进；若它不动，说明 source 根本没被播放（例如被 pause 卡住）。
+pub fn playtest(path: &std::path::Path) {
+    use crate::analysis::{start_analysis, types::AnalysisEvent};
+    use crate::audio::{AudioEngine, PlaybackMode};
+    use std::time::{Duration, Instant};
+
+    println!("播放自检：{}", path.display());
+    let mut handle = start_analysis(path.to_path_buf());
+    let (result, pcm) = loop {
+        let mut done = None;
+        for evt in handle.poll() {
+            match evt {
+                AnalysisEvent::Finished { result, pcm } => done = Some((*result, pcm)),
+                AnalysisEvent::Failed(e) => {
+                    eprintln!("分析失败：{e}");
+                    return;
+                }
+                AnalysisEvent::Progress { .. } => {}
+            }
+        }
+        if let Some(v) = done {
+            break v;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    };
+
+    let mut engine = AudioEngine::default();
+    engine.load(pcm, result.channels.max(1), result.sample_rate.max(1), result.duration);
+    match engine.mode() {
+        PlaybackMode::Real => println!("输出模式：真实音频输出（rodio/cpal）"),
+        PlaybackMode::Simulated => println!(
+            "输出模式：模拟走时（无可用输出设备）{}",
+            engine
+                .fallback_reason()
+                .map(|r| format!(" → {r}"))
+                .unwrap_or_default()
+        ),
+    }
+
+    let t0 = Instant::now();
+    engine.play();
+    let mut last = -1.0f64;
+    while t0.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(50));
+        engine.tick();
+        let p = engine.position();
+        if (p - last).abs() > 1e-6 {
+            println!("  t={:.2}s  播放头 {:.3}s  playing={}", t0.elapsed().as_secs_f32(), p, engine.is_playing());
+            last = p;
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let advanced = engine.position();
+    engine.pause();
+
+    println!(
+        "结果：{:.2}s 内播放头推进 {:.3}s（real={}）",
+        elapsed,
+        advanced,
+        matches!(engine.mode(), PlaybackMode::Real)
+    );
+    let ok = advanced > 0.5 && matches!(engine.mode(), PlaybackMode::Real);
+    println!("=== 播放自检{} ===", if ok { "通过：播放头随实际输出推进" } else { "失败：播放头未推进 / 非真实输出" });
+}
