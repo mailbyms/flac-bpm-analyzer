@@ -36,6 +36,7 @@ fn main() -> Result<(), eframe::Error> {
         "FLAC 节拍分析器",
         options,
         Box::new(move |cc| {
+            FlacBpmApp::configure(&cc.egui_ctx);
             setup_fonts(&cc.egui_ctx);
             setup_style(&cc.egui_ctx);
             Ok(Box::new(FlacBpmApp::new()))

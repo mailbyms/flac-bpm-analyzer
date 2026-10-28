@@ -92,6 +92,7 @@ fn run_pipeline(
     send(tx, 0.02, "正在打开 FLAC 文件…");
 
     // ---- 1) 解码 + 混音 + 降采样 ----
+    // 阶段权重按真实耗时分配：解码+降采样是最重的一段，给它 3%~58%
     let mut last_reported = -1.0f32;
     let DecodedAudio {
         meta,
@@ -99,33 +100,38 @@ fn run_pipeline(
         analysis_sr,
         playback,
     } = decode_flac(path, |p| {
-        // 解码阶段占 2% ~ 80%
-        let mapped = 0.02 + p * 0.78;
-        if (mapped - last_reported).abs() > 0.015 {
+        // decode_flac 内部约定：解码循环 0~0.85，降采样 0.85~1.0
+        let mapped = 0.03 + p * 0.55;
+        let label = if p < 0.86 {
+            "正在解码音频…"
+        } else {
+            "正在降采样…"
+        };
+        if (mapped - last_reported).abs() > 0.01 {
             last_reported = mapped;
-            send(tx, mapped, "正在解码音频…");
+            send(tx, mapped, label);
         }
     })?;
 
     let duration = meta.duration.max(mono.len() as f32 / analysis_sr as f32);
 
     // ---- 2) 波形峰值（一次遍历聚合，后续绘图不再触碰原始 PCM） ----
-    send(tx, 0.82, "正在生成波形…");
+    send(tx, 0.62, "正在生成波形…");
     let waveform_peaks = compute_waveform_peaks(&mono, WAVEFORM_BUCKETS);
 
     // ---- 3) onset 包络 ----
-    send(tx, 0.86, "正在计算能量包络…");
+    send(tx, 0.74, "正在计算能量包络…");
     let (novelty, fps) = onset_envelope(&mono, analysis_sr);
     if novelty.len() < 32 {
         return Err(AnalysisError::Other("音频太短，无法进行节拍分析".into()));
     }
 
     // ---- 4) 自相关测速 + 相位对齐 + 置信度 ----
-    send(tx, 0.92, "正在估计 BPM…");
+    send(tx, 0.86, "正在估计 BPM…");
     let tempo = estimate_tempo(&novelty, fps);
 
     // ---- 5) 生成节拍序列 ----
-    send(tx, 0.97, "正在生成节拍表…");
+    send(tx, 0.95, "正在生成节拍表…");
     let beats = generate_beats(tempo.offset_sec, tempo.period_sec, duration);
 
     send(tx, 1.0, "完成");

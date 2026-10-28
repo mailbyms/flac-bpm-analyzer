@@ -1,6 +1,7 @@
 //! egui 应用：状态机（Empty / Loading / Analyzing / Ready / Error）与全部界面布局
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use egui::{
     Align, Align2, Color32, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, UiBuilder,
@@ -49,8 +50,15 @@ pub struct FlacBpmApp {
     file: Option<LoadedFile>,
     result: Option<AnalysisResult>,
     handle: Option<AnalysisHandle>,
+    /// 后台线程上报的目标进度（0~1）
     progress: f32,
+    /// 界面实际绘制的进度（向 progress 平滑逼近，避免数字长时间不动/突然跳变）
+    progress_shown: f32,
     progress_label: String,
+    /// 本轮分析的起始时刻，用于在阶段之间给出"仍在工作"的反馈
+    analysis_started: Option<Instant>,
+    /// 上一帧时刻，用于自行计算帧间隔（不依赖 egui 的 dt API）
+    last_frame: Option<Instant>,
     error: Option<String>,
     audio: AudioEngine,
     view: WaveViewState,
@@ -61,6 +69,20 @@ pub struct FlacBpmApp {
 }
 
 impl FlacBpmApp {
+    /// 输入语义配置：应在 `ctx.run` 之前调用一次（eframe 的 creator 回调里）。
+    ///
+    /// egui 默认把 `Ctrl/⌘ + 滚轮` 当成缩放手势（`InputOptions::zoom_modifier` 默认
+    /// 为 `Modifiers::COMMAND`），框架层会把滚轮增量经**平滑**后转成 Zoom 事件。
+    /// 那个平滑余量会在滚轮停下后继续释放若干帧，于是「滚完再按住 Ctrl」会变成
+    /// 持续缩放——波形自己放大。
+    ///
+    /// 因此这里把它置为 `NONE`：不让框架插手，改由 `ui::waveform` 用**未平滑**的
+    /// `raw_scroll_delta` 判定「本帧是否真的滚了」，Ctrl 缩放、平移语义全部自控。
+    /// （触控板捏合走独立的 `Event::Zoom`，不受此项影响。）
+    pub fn configure(ctx: &egui::Context) {
+        ctx.options_mut(|o| o.input_options.zoom_modifier = egui::Modifiers::NONE);
+    }
+
     pub fn new() -> Self {
         Self {
             stage: Stage::Empty,
@@ -68,7 +90,10 @@ impl FlacBpmApp {
             result: None,
             handle: None,
             progress: 0.0,
+            progress_shown: 0.0,
             progress_label: String::new(),
+            analysis_started: None,
+            last_frame: None,
             error: None,
             audio: AudioEngine::default(),
             view: WaveViewState::default(),
@@ -110,6 +135,8 @@ impl FlacBpmApp {
         self.result = None;
         self.handle = None;
         self.progress = 0.0;
+        self.progress_shown = 0.0;
+        self.analysis_started = None;
         self.error = None;
         self.status_extra = None;
         self.view = WaveViewState::default();
@@ -133,7 +160,9 @@ impl FlacBpmApp {
         if let Some(f) = &self.file {
             self.handle = Some(crate::analysis::start_analysis(f.path.clone()));
             self.progress = 0.0;
+            self.progress_shown = 0.0;
             self.progress_label = "准备中…".to_string();
+            self.analysis_started = Some(Instant::now());
             self.stage = Stage::Analyzing;
         }
     }
@@ -148,7 +177,9 @@ impl FlacBpmApp {
         self.view = WaveViewState::default();
         self.handle = Some(crate::analysis::start_analysis(path));
         self.progress = 0.0;
+        self.progress_shown = 0.0;
         self.progress_label = "准备中…".to_string();
+        self.analysis_started = Some(Instant::now());
         self.stage = Stage::Analyzing;
     }
 
@@ -213,6 +244,33 @@ impl FlacBpmApp {
         }
     }
 
+    /// 进度补间：把后台上报的离散进度平滑成连续推进，
+    /// 避免"长时间停在某个数字、然后一下子跳到 100%"。
+    fn tick_progress(&mut self) {
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map(|t| (now - t).as_secs_f32())
+            .unwrap_or(1.0 / 60.0)
+            .clamp(1.0 / 240.0, 0.25);
+        self.last_frame = Some(now);
+
+        if !matches!(self.stage, Stage::Loading | Stage::Analyzing) {
+            // 非分析态直接对齐，避免残留
+            self.progress_shown = self.progress;
+            return;
+        }
+
+        // 目标值只增不减，阶段切换时进度条不回退
+        let target = self.progress.max(self.progress_shown);
+        // 时间常数 0.18s：既平滑掉跳变，又不至于明显滞后于真实进度
+        let k = 1.0 - (-dt / 0.18f32).exp();
+        self.progress_shown += (target - self.progress_shown) * k;
+        if target >= 1.0 || (target - self.progress_shown).abs() < 0.002 {
+            self.progress_shown = target;
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let (space, left, right, o, ctrl) = ctx.input(|i| {
             (
@@ -251,11 +309,14 @@ impl eframe::App for FlacBpmApp {
 impl FlacBpmApp {
     /// 每帧逻辑（与 eframe 解耦，方便离屏冒烟测试）
     pub fn frame_update(&mut self, ctx: &egui::Context) {
+        Self::configure(ctx);
+
         // Loading 状态下启动后台分析
         if matches!(self.stage, Stage::Loading) {
             self.start_analysis();
         }
         self.poll();
+        self.tick_progress();
         self.audio.tick();
         self.handle_shortcuts(ctx);
 
@@ -267,6 +328,12 @@ impl FlacBpmApp {
 
         // 播放中持续重绘，保证播放头平滑推进
         if self.audio.is_playing() {
+            ctx.request_repaint();
+        }
+
+        // 分析期间必须持续重绘：egui 是反应式渲染，不主动请求就不会刷新，
+        // 否则进度条会一直停在某个数字，直到完成时才一次性跳到 100%。
+        if matches!(self.stage, Stage::Loading | Stage::Analyzing) {
             ctx.request_repaint();
         }
 
@@ -363,7 +430,7 @@ impl FlacBpmApp {
             Stage::Analyzing => format!(
                 "分析中 · {} {:.0}%",
                 self.progress_label,
-                self.progress * 100.0
+                self.progress_shown.clamp(0.0, 1.0) * 100.0
             ),
             Stage::Ready => self.status_extra.clone().unwrap_or_else(|| {
                 let bpm = self.result.as_ref().map(|r| format!("{:.1}", r.bpm)).unwrap_or_default();
@@ -488,7 +555,13 @@ impl FlacBpmApp {
             Pos2::new(content.left(), file_rect.bottom() + CARD_GAP),
             Pos2::new(content.right(), content.bottom()),
         );
-        let (p, label) = (self.progress, self.progress_label.clone());
+        // 用补间后的值绘制，保证数字与进度条是连续推进的
+        let p = self.progress_shown.clamp(0.0, 1.0);
+        let label = self.progress_label.clone();
+        let elapsed = self
+            .analysis_started
+            .map(|t| t.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
         ui.scope_builder(UiBuilder::new().max_rect(bar_rect), |ui| {
             card_frame().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
@@ -499,17 +572,21 @@ impl FlacBpmApp {
                             .color(TEXT),
                     );
                     ui.add_space(14.0);
-                    let bar = egui::ProgressBar::new(p.clamp(0.0, 1.0))
+                    let bar = egui::ProgressBar::new(p)
                         .desired_width((ui.available_width() * 0.6).clamp(220.0, 560.0))
                         .desired_height(8.0)
                         .fill(PRIMARY)
                         .corner_radius(4.0);
                     ui.add(bar);
                     ui.add_space(10.0);
+                    // 已用时间持续走动，即使某一阶段暂无细分进度也能看出程序在工作
                     ui.label(
-                        RichText::new("正在解码 → 降采样 → onset 包络 → 自相关测速")
-                            .size(12.0)
-                            .color(TEXT_SUB),
+                        RichText::new(format!(
+                            "已用 {:.1} s · 解码 → 降采样 → 波形 → onset 包络 → 自相关测速",
+                            elapsed
+                        ))
+                        .size(12.0)
+                        .color(TEXT_SUB),
                     );
                 });
             });
@@ -751,5 +828,286 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} MB", b / KB / KB)
     } else {
         format!("{:.2} GB", b / KB / KB / KB)
+    }
+}
+
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+    use crate::analysis::types::AnalysisResult;
+
+    /// 造一份可直接进入 Ready 态的假结果
+    fn fake_result() -> AnalysisResult {
+        let period = 0.5;
+        AnalysisResult {
+            bpm: 120.0,
+            confidence: 0.92,
+            first_beat_offset: 0.12,
+            beats: (0..480).map(|i| 0.12 + i as f32 * period).collect(),
+            duration: 240.0,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            channels: 2,
+            waveform_peaks: vec![0.45; 8192],
+            beats_per_bar: 4,
+        }
+    }
+
+    fn ready_app(result: AnalysisResult, zoom: f32, start: f32) -> FlacBpmApp {
+        let mut app = FlacBpmApp::new();
+        app.stage = Stage::Ready;
+        app.file = Some(LoadedFile {
+            name: "test.flac".into(),
+            path: std::path::PathBuf::from("test.flac"),
+            size_bytes: 28_000_000,
+        });
+        app.result = Some(result);
+        app.view = crate::ui::waveform::WaveViewState { zoom, start_sec: start };
+        app
+    }
+
+    /// 跑一帧并返回本帧产生的所有绘制指令（离屏、无需 GPU/窗口）
+    fn frame(
+        app: &mut FlacBpmApp,
+        ctx: &egui::Context,
+        pointer: Option<egui::Pos2>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let events = pointer
+            .map(egui::Event::PointerMoved)
+            .into_iter()
+            .collect();
+        frame_raw(app, ctx, egui::Modifiers::NONE, events)
+    }
+
+    /// 同上，但可指定修饰键与任意输入事件（用于验证滚轮/捏合语义）
+    fn frame_raw(
+        app: &mut FlacBpmApp,
+        ctx: &egui::Context,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        FlacBpmApp::configure(ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(1440.0, 920.0),
+            )),
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| app.frame_update(ctx)).shapes
+    }
+
+    /// 在本帧绘制指令里找包含指定文字的文本图元
+    fn has_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::Text(ts) => ts.galley.text().contains(needle),
+            _ => false,
+        })
+    }
+
+    /// 离屏渲染若干帧，覆盖全曲视图 / 放大视图 / 滚到曲末 / 指针扫过舞台
+    #[test]
+    fn 界面渲染不panic且悬停路径可执行() {
+        let ctx = egui::Context::default();
+        for (zoom, start) in [(1.0, 0.0), (6.0, 30.0), (20.0, 200.0), (60.0, 239.0)] {
+            let mut app = ready_app(fake_result(), zoom, start);
+            frame(&mut app, &ctx, None);
+            // 指针扫过舞台区域，触发节拍悬停命中与提示绘制
+            let mut y = 380.0;
+            while y <= 700.0 {
+                let mut x = 40.0;
+                while x <= 1400.0 {
+                    frame(&mut app, &ctx, Some(egui::Pos2::new(x, y)));
+                    x += 40.0;
+                }
+                y += 40.0;
+            }
+        }
+    }
+
+    /// 空状态同样要能渲染
+    #[test]
+    fn 空状态渲染不panic() {
+        let ctx = egui::Context::default();
+        let mut app = FlacBpmApp::new();
+        frame(&mut app, &ctx, None);
+        frame(&mut app, &ctx, Some(egui::Pos2::new(720.0, 460.0)));
+    }
+
+    /// 指针扫过舞台时，命中节拍线应真的画出提示气泡（而不是只跑通代码）
+    #[test]
+    fn 悬停节拍线会画出提示气泡() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 4.0, 0.0);
+        let mut hits = 0;
+        let mut x = 40.0;
+        while x <= 1400.0 {
+            let shapes = frame(&mut app, &ctx, Some(egui::Pos2::new(x, 500.0)));
+            if has_text(&shapes, "节拍 #") {
+                hits += 1;
+            }
+            x += 3.0;
+        }
+        assert!(hits > 0, "扫过舞台时应至少命中一条节拍线并绘制提示气泡");
+    }
+
+    /// 只按住 Ctrl（滚轮完全没动）→ 波形必须纹丝不动，既不缩放也不平移。
+    ///
+    /// 回归测试：egui 的 smooth_scroll_delta 在滚轮停下后仍会释放几帧余量，
+    /// 若用平滑值判定缩放，就会出现「只按 Ctrl 波形自己放大」。
+    #[test]
+    fn 只按ctrl波形不动() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 4.0, 30.0);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let pt = egui::Pos2::new(700.0, 500.0);
+
+        // 先滚一下滚轮（不按 Ctrl），制造平滑余量
+        for _ in 0..3 {
+            frame_raw(
+                &mut app,
+                &ctx,
+                egui::Modifiers::NONE,
+                vec![
+                    egui::Event::PointerMoved(pt),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::Vec2::new(0.0, -1.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        // 然后只按住 Ctrl，滚轮不再动，连跑 10 帧
+        let zoom0 = app.view.zoom;
+        let start0 = app.view.start_sec;
+        for _ in 0..10 {
+            frame_raw(&mut app, &ctx, ctrl, vec![egui::Event::PointerMoved(pt)]);
+        }
+        assert!(
+            (app.view.zoom - zoom0).abs() < 1e-3,
+            "只按 Ctrl 不应缩放：{zoom0} → {}",
+            app.view.zoom
+        );
+        assert!(
+            (app.view.start_sec - start0).abs() < 1e-3,
+            "只按 Ctrl 也不应平移：{start0} → {}",
+            app.view.start_sec
+        );
+    }
+
+    /// Ctrl + 滚轮 = 缩放（且不产生平移）
+    #[test]
+    fn ctrl加滚轮缩放() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 4.0, 60.0);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let pt = egui::Pos2::new(700.0, 500.0);
+        let zoom0 = app.view.zoom;
+        for _ in 0..3 {
+            frame_raw(
+                &mut app,
+                &ctx,
+                ctrl,
+                vec![
+                    egui::Event::PointerMoved(pt),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::Vec2::new(0.0, -1.0),
+                        modifiers: ctrl,
+                    },
+                ],
+            );
+        }
+        assert!(
+            app.view.zoom < zoom0 * 0.9,
+            "Ctrl+向下滚应缩小视图：{zoom0} → {}",
+            app.view.zoom
+        );
+    }
+
+    /// 单滚轮（不按 Ctrl）= 横向平移，不缩放
+    #[test]
+    fn 单滚轮只平移不缩放() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 4.0, 30.0);
+        let pt = egui::Pos2::new(700.0, 500.0);
+        let zoom0 = app.view.zoom;
+        let start0 = app.view.start_sec;
+        for _ in 0..6 {
+            frame_raw(
+                &mut app,
+                &ctx,
+                egui::Modifiers::NONE,
+                vec![
+                    egui::Event::PointerMoved(pt),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::Vec2::new(0.0, -1.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(
+            (app.view.zoom - zoom0).abs() < 1e-3,
+            "单滚轮不应改变缩放：{zoom0} → {}",
+            app.view.zoom
+        );
+        assert!(
+            app.view.start_sec > start0 + 0.05,
+            "单滚轮应横向平移：start {start0} → {}",
+            app.view.start_sec
+        );
+    }
+
+    /// 触控板双指捏合仍然缩放（唯一保留的手势缩放入口）
+    #[test]
+    fn 触控板捏合仍然缩放() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 4.0, 60.0);
+        let zoom0 = app.view.zoom;
+        for _ in 0..3 {
+            frame_raw(
+                &mut app,
+                &ctx,
+                egui::Modifiers::NONE,
+                vec![
+                    egui::Event::PointerMoved(egui::Pos2::new(700.0, 500.0)),
+                    egui::Event::Zoom(1.6),
+                ],
+            );
+        }
+        assert!(
+            app.view.zoom > zoom0 * 1.2,
+            "捏合应放大视图：{zoom0} → {}",
+            app.view.zoom
+        );
+    }
+
+    /// 滚动条：放大后应出现滑块图元（全曲视图下不该有可拖动的窄滑块）
+    #[test]
+    fn 放大后出现滚动条滑块() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 8.0, 60.0);
+        let shapes = frame(&mut app, &ctx, None);
+        // 滑块宽 = 轨道宽 × 可视比例，8 倍放大下应远窄于舞台宽度
+        let narrow = shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::Rect(rs) => {
+                let w = rs.rect.width();
+                let h = rs.rect.height();
+                (h - 8.0).abs() < 0.6 && w > 30.0 && w < 300.0
+            }
+            _ => false,
+        });
+        assert!(narrow, "8 倍放大时应绘制出窄滑块");
     }
 }

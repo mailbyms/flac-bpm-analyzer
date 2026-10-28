@@ -129,15 +129,11 @@ pub fn decode_flac(path: &Path, mut progress: impl FnMut(f32)) -> Result<Decoded
 
     let mut decoder = symphonia::default::get_codecs().make(params, &DecoderOptions::default())?;
 
-    // 估算总样本数，用于「解码结束后」的重采样/包络阶段划分进度
-    let estimated_frames = if n_frames > 0 {
-        Some(n_frames)
-    } else if src_sr > 0 && file_len > 0 {
-        // 兜底：按 FLAC 平均压缩率猜测（约 60%）
-        Some((file_len as u64 * 60 / 100) / (channels as u64 * (bits as u64 / 8)))
-    } else {
-        None
-    };
+    // 估算总样本数，用于把解码进度换算成百分比。
+    // 注意：不要用「文件大小 × 猜测压缩率」去反推帧数 —— 压缩率因素材而异（50%~70%），
+    // 猜错时进度条会长期停在偏低的位置、然后突然跳到下一阶段。
+    // 拿不到 n_frames 时就退化为「已读字节 / 总字节」，虽然不严格线性，但至少单调且量级正确。
+    let estimated_frames = if n_frames > 0 { Some(n_frames) } else { None };
 
     let mut interleaved: Vec<f32> = Vec::new();
     let mut mono_at_src: Vec<f32> = Vec::new();
@@ -201,12 +197,14 @@ pub fn decode_flac(path: &Path, mut progress: impl FnMut(f32)) -> Result<Decoded
     }
 
     // ---- 降采样到分析采样率（线性插值） ----
+    // 与调用方约定：解码循环上报 0~0.85，降采样 0.85~1.0
     progress(0.88);
     let mono = if src_sr != TARGET_ANALYSIS_SR {
         resample_linear(&mono_at_src, src_sr, TARGET_ANALYSIS_SR)
     } else {
         mono_at_src
     };
+    progress(1.0);
 
     let duration = mono.len() as f32 / TARGET_ANALYSIS_SR as f32;
 
