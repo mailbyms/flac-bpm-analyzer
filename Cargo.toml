@@ -1,6 +1,6 @@
 [package]
 name = "flac-bpm-analyzer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "音频节拍分析器：导入单个 FLAC / MP3，自动估计 BPM，展示波形与节拍"
 

@@ -42,6 +42,15 @@ pub const TEMPO_PRIOR_STRENGTH: f32 = 0.45;
 pub const TEMPO_PRIOR_OCTAVE_WIDTH: f32 = 1.9;
 /// 未知结果时的兜底 BPM
 pub const FALLBACK_BPM: f32 = 120.0;
+/// 半速陷阱修正：结果低于该 BPM 时，才检查是否该翻倍
+pub const HALF_TIME_LIMIT_BPM: f32 = 70.0;
+/// 半速陷阱修正：两倍速候选的梳状分达到当前分的这个比例，就判定为「强弱交替导致的半速」
+///
+/// 阈值依据（合成信号实测，见 tools/diag_octave.py）：
+///   * 真正 62.5 / 70 / 80 / 90 BPM 的曲子，两倍速处几乎无能量，比值为 0.05 ~ 0.35
+///   * 真 125 BPM 但相邻拍强弱交替（Creep.flac），比值为 0.75
+/// 取 0.7 有充足裕量。
+pub const HALF_TIME_RATIO: f32 = 0.7;
 
 /// 线性插值重采样（整数倍 / 非整数倍都适用，简单且足够用于能量分析）
 pub fn resample_linear(input: &[f32], src_sr: u32, dst_sr: u32) -> Vec<f32> {
@@ -374,16 +383,26 @@ pub fn estimate_tempo(novelty: &[f32], fps: f32) -> TempoResult {
         }
         let period_f = refine_lag(&r, lag);
         let score = comb_score(&c, period_f, n);
-        // 轻微偏好原始 ACF 峰，避免过度翻倍
-        let bonus = if lag == best_lag { 1.02 } else { 1.0 };
-        // 倍频/分频打成平手时，以 120 BPM 为中心的温和先验决定倾向
+        // 倍频/分频打成平手时，以 125 BPM 为中心的温和先验决定倾向。
+        //
+        // 这里**不能**再给「原始 ACF 最大 lag」额外加权：实测 Creep.flac（真 125 BPM，
+        // 相邻拍强弱交替）的原始峰恰好落在半速 62.5 上，任何朝原始峰的奖励都会把半速坐实。
         let bpm_i = 60.0 * fps / period_f;
         let prior = tempo_prior(bpm_i);
-        let score = score * bonus * prior;
+        let score = score * prior;
         if score > best_score {
             best_score = score;
             chosen_period = period_f;
         }
+    }
+
+    // ---- 半速陷阱修正 ----
+    // 翻倍时记下「原来的两拍周期」：信号最强的周期性证据在那一处，置信度要用它来评估。
+    // 否则会拿半拍处的弱峰去算，得出一个误导性的低置信度。
+    let mut evidence_lag = None;
+    if let Some(fast) = fix_half_time(&c, chosen_period, fps, lag_min, lag_max, n) {
+        evidence_lag = Some(chosen_period.round() as usize);
+        chosen_period = fast;
     }
 
     let refined_lag = chosen_period;
@@ -398,7 +417,10 @@ pub fn estimate_tempo(novelty: &[f32], fps: f32) -> TempoResult {
     let offset_sec = ((offset_frames + half_window_frames) / fps).max(0.0);
     let period_sec = period_frames / fps;
 
-    let confidence = estimate_confidence(&r, refined_lag.round() as usize, lag_min, lag_max);
+    let conf_lag = evidence_lag
+        .unwrap_or(refined_lag.round() as usize)
+        .min(r.len().saturating_sub(1));
+    let confidence = estimate_confidence(&r, conf_lag, lag_min, lag_max);
 
     TempoResult {
         bpm: bpm.clamp(MIN_BPM * 0.5, MAX_BPM * 2.0),
@@ -406,6 +428,47 @@ pub fn estimate_tempo(novelty: &[f32], fps: f32) -> TempoResult {
         offset_sec,
         period_sec,
     }
+}
+
+/// 半速陷阱修正：把「因为相邻拍强弱交替而被判成半速」的结果翻回两倍速。
+///
+/// 现象：4/4 流行/摇滚的鼓组是 kick / snare 交替，平移 1 拍后强峰对弱峰，1 拍处的
+/// 自相关会腰斩，而 2 拍处才是完整循环。于是 ACF 主导周期变成 2 拍，BPM 被判成一半。
+///
+/// 判据：结果低于 `HALF_TIME_LIMIT_BPM` 时，看两倍速候选的梳状分能保住当前分的多少。
+/// 真正的慢歌在半拍位置几乎没有 onset，这个比值很低（0.05~0.35）；
+/// 而强弱交替的快歌在两倍速处仍有很强的周期性（0.75 左右）。阈值取 0.7。
+///
+/// 返回 `Some(两倍速周期)` 表示发生了翻倍，`None` 表示维持原判。
+pub fn fix_half_time(
+    c: &[f32],
+    period: f32,
+    fps: f32,
+    lag_min: usize,
+    lag_max: usize,
+    n_frames: usize,
+) -> Option<f32> {
+    let bpm = 60.0 * fps / period.max(1e-6);
+    if bpm >= HALF_TIME_LIMIT_BPM {
+        return None;
+    }
+    // 两倍速的周期就是当前周期的一半；细化后的周期误差在这里也减半，通常更准
+    let fast_period = period * 0.5;
+    if (fast_period.round() as usize) < lag_min || (fast_period.round() as usize) > lag_max {
+        return None;
+    }
+    let slow_score = comb_score(c, period, n_frames);
+    let fast_score = comb_score(c, fast_period, n_frames);
+    if should_double_for_half_time(bpm, slow_score, fast_score) {
+        Some(fast_period)
+    } else {
+        None
+    }
+}
+
+/// 半速陷阱的判定条件（纯逻辑，便于用实测数值做回归）
+fn should_double_for_half_time(bpm: f32, slow_score: f32, fast_score: f32) -> bool {
+    bpm < HALF_TIME_LIMIT_BPM && slow_score > 1e-6 && fast_score / slow_score >= HALF_TIME_RATIO
 }
 
 /// 把 lag 及其倍频/分频候选加入候选列表（若落在合法 lag 区间内）
@@ -561,4 +624,45 @@ pub fn generate_beats(offset_sec: f32, period_sec: f32, duration_sec: f32) -> Ve
         t += period_sec;
     }
     beats
+}
+
+#[cfg(test)]
+mod half_time_tests {
+    use super::*;
+
+    /// 半速陷阱判定：用实测过的数值做回归
+    #[test]
+    fn 强弱交替会被判定为半速陷阱() {
+        // Creep.flac 实测：被判 62.5，comb(62.5)=0.5775（慢）、comb(125)=0.4342（快）
+        assert!(
+            should_double_for_half_time(62.5, 0.5775, 0.4342),
+            "真 125 BPM 的强弱交替素材应翻倍"
+        );
+    }
+
+    /// 真正 62.5 BPM 的慢曲：半拍处几乎没有 onset，比值极低，不能翻倍
+    #[test]
+    fn 真正的慢曲不会被翻倍() {
+        // 合成 62.5 BPM 等强鼓点实测：comb(62.5)=0.9262、comb(125)=0.0682
+        assert!(
+            !should_double_for_half_time(62.5, 0.9262, 0.0682),
+            "真 62.5 BPM 不应被翻成 125"
+        );
+    }
+
+    /// 只在低于阈值时才受理，避免把正常速度的曲子推快
+    #[test]
+    fn 高于阈值不触发() {
+        assert!(!should_double_for_half_time(70.0, 1.0, 1.0));
+        assert!(!should_double_for_half_time(80.0, 0.9, 0.89));
+        // 边界内侧仍受理
+        assert!(should_double_for_half_time(69.9, 1.0, 0.7));
+    }
+
+    /// 慢周期分数异常（接近 0）时不做除法判断，直接维持原判
+    #[test]
+    fn 分数异常时不翻倍() {
+        assert!(!should_double_for_half_time(62.5, 0.0, 1.0));
+        assert!(!should_double_for_half_time(62.5, 1e-9, 1.0));
+    }
 }

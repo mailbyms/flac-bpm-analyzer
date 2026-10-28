@@ -800,7 +800,14 @@ impl FlacBpmApp {
                     .color(TEXT_SUB),
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("音频节拍分析器 v0.1.0").size(12.0).color(TEXT_SUB));
+                ui.label(
+                    RichText::new(format!(
+                        "音频节拍分析器 v{}",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .size(12.0)
+                    .color(TEXT_SUB),
+                );
             });
     }
 }
