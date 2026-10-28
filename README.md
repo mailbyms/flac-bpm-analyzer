@@ -45,6 +45,29 @@ cargo test --release
 | `src/audio.rs` | 播放控制（真实输出 / 无设备时降级为模拟走时） |
 | `src/export.rs` | 节拍表 CSV 导出（UTF-8 BOM，Excel 可直接打开） |
 | `src/selftest.rs` | 自检与命令行分析模式（开发/验证用） |
+| `build.rs` | 构建脚本：调 Windows SDK 的 `rc.exe` 把 `.ico` 嵌进 exe（找不到则只告警、不中断） |
+| `assets/icon.ico` | 应用图标多尺寸（16/24/32/48/64/128 BMP + 256 PNG） |
+| `assets/icon_256.rgba` | 窗口/任务栏图标，原始 RGBA，运行时 `include_bytes!` 直接用（免解码依赖） |
+| `tools/gen_icon.py` | 图标生成脚本（纯标准库：超采样渲染 + PNG/ICO 手写编码） |
+| `tools/check_icon.py` | 验证 exe 是否真的嵌入了图标（解析 PE 资源表） |
+
+## 应用图标
+
+图标与界面左上角那个应用图标同源：**橙色圆角方块 `#E07856` + 白色波形**
+（几何直接取自界面里的 24×24 SVG：`rect rx=7` + 五段 `stroke-width=1.8` 的圆头线）。
+
+- **exe 图标**（资源管理器/桌面）：`build.rs` 生成临时 `.rc`，用 Windows SDK 的 `rc.exe`
+  编译成 `.res`，再作为 `rustc-link-arg` 交给 `link.exe`。因此需要装 Windows SDK；
+  找不到 `rc.exe` 时构建照常成功，只是 exe 没有图标（会打一行 `cargo:warning`）。
+- **窗口/任务栏图标**：`src/main.rs::app_icon()` 读 `assets/icon_256.rgba` 构造 `egui::IconData`。
+
+改了图标后重新生成并验证：
+
+```bash
+python tools/gen_icon.py                                   # 产出 ico/png/rgba
+cargo build --release
+python tools/check_icon.py target/release/flac-bpm-analyzer.exe   # 应列出 7 个尺寸
+```
 
 ## 依赖说明
 
