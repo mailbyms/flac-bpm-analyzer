@@ -1131,6 +1131,71 @@ mod smoke_tests {
         frame_raw(app, ctx, m, ev(false));
     }
 
+    /// 左键点击一次（press + release 两帧）
+    fn click_at(app: &mut FlacBpmApp, ctx: &egui::Context, pos: egui::Pos2) {
+        let m = egui::Modifiers::NONE;
+        let ev = |pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: m,
+                },
+            ]
+        };
+        frame_raw(app, ctx, m, ev(true));
+        frame_raw(app, ctx, m, ev(false));
+    }
+
+    /// 找包含指定文本的图元中心，用于点中某块界面
+    fn text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        shapes.iter().find_map(|cs| match &cs.shape {
+            egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                Some(ts.pos + ts.galley.size() * 0.5)
+            }
+            _ => None,
+        })
+    }
+
+    /// 拍号卡片整块可点：4/4 → 3/4 → 2/4 → 4/4，徽章从「推测」变「手动」
+    #[test]
+    fn 点击拍号卡片循环切换() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(fake_result(), 20.0, 0.0);
+
+        let shapes = frame(&mut app, &ctx, None);
+        assert!(has_text(&shapes, "4 / 4"), "初始应显示 4 / 4");
+        assert!(has_text(&shapes, "推测"), "自动推断时应标「推测」");
+
+        let pos = text_center(&shapes, "4 / 4").expect("找不到拍号文本");
+        click_at(&mut app, &ctx, pos);
+        assert_eq!(
+            app.result.as_ref().unwrap().beats_per_bar,
+            3,
+            "4/4 点一下应变成 3/4"
+        );
+        assert!(app.meter_manual, "手动改过之后应标记为手动");
+
+        let shapes = frame(&mut app, &ctx, None);
+        assert!(has_text(&shapes, "3 / 4"), "应显示切换后的 3 / 4");
+        assert!(has_text(&shapes, "手动"), "徽章应变为「手动」");
+
+        let pos = text_center(&shapes, "3 / 4").expect("找不到拍号文本");
+        click_at(&mut app, &ctx, pos);
+        assert_eq!(app.result.as_ref().unwrap().beats_per_bar, 2);
+
+        let shapes = frame(&mut app, &ctx, None);
+        let pos = text_center(&shapes, "2 / 4").expect("找不到拍号文本");
+        click_at(&mut app, &ctx, pos);
+        assert_eq!(
+            app.result.as_ref().unwrap().beats_per_bar,
+            4,
+            "2/4 之后应回到 4/4"
+        );
+    }
+
     /// 右键点击波形两次 = 手工测速：应记录打点、算出 BPM，并给出「采用」按钮
     #[test]
     fn 右键点击可手工测速() {
