@@ -88,6 +88,8 @@ pub struct FlacBpmApp {
     status_extra: Option<String>,
     /// 齿轮设置面板开关
     settings_open: bool,
+    /// 用户是否手动改过拍号（改过就不再显示「自动推测」）
+    meter_manual: bool,
 }
 
 impl FlacBpmApp {
@@ -122,6 +124,7 @@ impl FlacBpmApp {
             tap: TapTempo::default(),
             status_extra: None,
             settings_open: false,
+            meter_manual: false,
         }
     }
 
@@ -166,6 +169,7 @@ impl FlacBpmApp {
         self.status_extra = None;
         self.view = WaveViewState::default();
         self.tap.clear();
+        self.meter_manual = false;
         self.file = Some(LoadedFile {
             name,
             path,
@@ -202,6 +206,7 @@ impl FlacBpmApp {
         self.audio.stop();
         self.view = WaveViewState::default();
         self.tap.clear();
+        self.meter_manual = false;
         self.handle = Some(crate::analysis::start_analysis(path));
         self.progress = 0.0;
         self.progress_shown = 0.0;
@@ -671,7 +676,13 @@ impl FlacBpmApp {
             ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
                 card_frame().show(ui, |ui| match i {
                     0 => metric_bpm_card(ui, result, self.tap.applied.is_some()),
-                    1 => metric_simple_card(ui, "拍号", "4 / 4"),
+                    1 => {
+                        // 拍号推断不可能全对（4/4 与 2/4 在信号上等价），点一下就能改
+                        if metric_meter_card(ui, result, self.meter_manual) {
+                            result.beats_per_bar = next_meter(result.beats_per_bar);
+                            self.meter_manual = true;
+                        }
+                    }
                     2 => metric_simple_card(
                         ui,
                         "首拍偏移",
@@ -918,6 +929,67 @@ fn metric_simple_card(ui: &mut Ui, title: &str, value: &str) {
     });
 }
 
+/// 拍号卡：**整张卡可点**，循环切换 4/4 → 3/4 → 2/4
+///
+/// 自动推断有天花板（4/4 与 2/4 在信号上等价、6/8 与 3/4 同周期、没有鼓的曲子
+/// 无从下手），必须给用户一个现场改的办法，否则误判只能改代码。
+///
+/// 返回是否被点击。
+fn metric_meter_card(ui: &mut Ui, result: &AnalysisResult, manual: bool) -> bool {
+    let inner = ui
+        .vertical(|ui| {
+            ui.label(RichText::new("拍号").size(12.5).color(TEXT_SUB));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(result.meter_label()).size(28.0).color(TEXT));
+                ui.add_space(8.0);
+                // 徽章沿用 BPM 卡那套「置信度」样式：一眼能看出这是推测值而非确定值
+                let (bg, fg, text) = if manual {
+                    (
+                        Color32::from_rgb(0xFD, 0xF1, 0xEA),
+                        Color32::from_rgb(0xC0, 0x56, 0x2F),
+                        "手动".to_string(),
+                    )
+                } else if result.meter_confidence > 0.0 {
+                    (
+                        BADGE_GREEN_BG,
+                        BADGE_GREEN_FG,
+                        format!("推测 {:.0}%", result.meter_confidence * 100.0),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(0xF3, 0xEF, 0xE8),
+                        TEXT_SUB,
+                        "推测".to_string(),
+                    )
+                };
+                egui::Frame::NONE
+                    .fill(bg)
+                    .corner_radius(10.0)
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(text).size(11.5).color(fg));
+                    });
+            });
+        })
+        .response;
+
+    let hit = ui.interact(inner.rect, ui.id().with("meter_card_click"), Sense::click());
+    if hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    hit.on_hover_text("点击切换拍号：4/4 → 3/4 → 2/4").clicked()
+}
+
+/// 拍号循环：4/4 → 3/4 → 2/4 → 4/4
+fn next_meter(current: i32) -> i32 {
+    match current {
+        4 => 3,
+        3 => 2,
+        _ => 4,
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let b = bytes as f64;
@@ -951,6 +1023,8 @@ mod smoke_tests {
             channels: 2,
             waveform_peaks: vec![0.45; 8192],
             beats_per_bar: 4,
+            downbeat_phase: 0,
+            meter_confidence: 0.85,
         }
     }
 

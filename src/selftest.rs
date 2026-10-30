@@ -91,7 +91,7 @@ pub fn analyze_file(path: &std::path::Path) -> Option<crate::analysis::types::An
                 }
                 AnalysisEvent::Finished { result, pcm: _ } => {
                     println!(
-                        "\n完成（耗时 {:.2}s）：BPM {:.2} | 置信度 {:.0}% | 首拍偏移 {:.3}s | 时长 {:.1}s | {} Hz / {} bit / {} 声道 | 共 {} 拍 | PCM 峰值桶 {}",
+                        "\n完成（耗时 {:.2}s）：BPM {:.2} | 置信度 {:.0}% | 首拍偏移 {:.3}s | 时长 {:.1}s | {} Hz / {} bit / {} 声道 | 共 {} 拍 | 拍号 {} | PCM 峰值桶 {}",
                         timer.elapsed().as_secs_f32(),
                         result.bpm,
                         result.confidence * 100.0,
@@ -101,7 +101,15 @@ pub fn analyze_file(path: &std::path::Path) -> Option<crate::analysis::types::An
                         result.bits_per_sample,
                         result.channels,
                         result.beats.len(),
+                        result.meter_label(),
                         result.waveform_peaks.len()
+                    );
+                    // 拍号是推测值：把把握与重拍相位一并打出来，方便判断要不要手动改
+                    println!(
+                        "拍号推测：{}（把握 {:.0}%，第 {} 拍起算小节）",
+                        result.meter_label(),
+                        result.meter_confidence * 100.0,
+                        result.downbeat_phase + 1
                     );
                     if !result.beats.is_empty() {
                         println!(

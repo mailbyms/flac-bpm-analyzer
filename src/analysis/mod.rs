@@ -12,7 +12,8 @@ use types::{AnalysisError, AnalysisEvent, AnalysisResult};
 
 use self::decode::{decode_audio, DecodedAudio};
 use self::dsp::{
-    compute_waveform_peaks, estimate_tempo, generate_beats, onset_envelope, WAVEFORM_BUCKETS,
+    beat_strengths, compute_waveform_peaks, detect_meter, estimate_tempo, generate_beats,
+    low_band_envelope, onset_envelope, WAVEFORM_BUCKETS,
 };
 
 /// 后台分析任务的句柄：UI 只需不断 `poll()` 收事件
@@ -131,8 +132,15 @@ fn run_pipeline(
     let tempo = estimate_tempo(&novelty, fps);
 
     // ---- 5) 生成节拍序列 ----
-    send(tx, 0.95, "正在生成节拍表…");
+    send(tx, 0.93, "正在生成节拍表…");
     let beats = generate_beats(tempo.offset_sec, tempo.period_sec, duration);
+
+    // ---- 6) 拍号与小节重拍 ----
+    // 单独算一路低频包络：宽带 onset 会被 snare 带偏，判不出小节头
+    send(tx, 0.97, "正在推断拍号…");
+    let low_env = low_band_envelope(&mono, analysis_sr);
+    let strengths = beat_strengths(&low_env, fps, &beats);
+    let meter = detect_meter(&strengths);
 
     send(tx, 1.0, "完成");
     Ok(PipelineOutput {
@@ -146,7 +154,9 @@ fn run_pipeline(
             bits_per_sample: meta.bits_per_sample,
             channels: meta.channels.max(playback.channels),
             waveform_peaks,
-            beats_per_bar: 4,
+            beats_per_bar: meter.beats_per_bar,
+            downbeat_phase: meter.phase,
+            meter_confidence: meter.confidence,
         },
         pcm: std::sync::Arc::new(playback.interleaved),
     })

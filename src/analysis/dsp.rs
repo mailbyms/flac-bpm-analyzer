@@ -1,14 +1,15 @@
-//! DSP：重采样、能量包络、onset 检测、自相关测速、相位对齐、节拍生成、置信度
+//! DSP：重采样、能量包络、onset 检测、自相关测速、相位对齐、节拍生成、置信度、拍号推断
 //!
 //! 流程（analysis/mod.rs 里串起来）：
 //!   PCM(单声道) → 降采样 → 分帧 RMS → 对数压缩 → 半波整流差分 → 滑动均值归一化
 //!     → 自相关求 BPM 候选（含倍频处理） → 抛物线插值细化 → 相位扫描 → 生成节拍表
+//!     → 低频包络 → 每拍强度 → 拍号（3 拍组 / 4 拍组）与小节重拍相位
 //!
 //! 可改进点（未实现，见 README「已知限制」）：
 //!   * 当前 onset 用「能量差分」，对鼓点弱、持续音强的音乐鲁棒性一般；
 //!     换成 STFT 谱通量（spectral flux）+ rustfft 可明显提升精度；
 //!   * 自相关用的是全局单点估计，未做 tempo 跟踪（长曲中的速度变化不处理）；
-//!   * 拍号固定 4/4，未做拍号 / 小节层次推断。
+//!   * 拍号只到「3 拍组 / 4 拍组」，4/4 与 2/4、6/8 与 3/4 都不区分。
 
 // ---------------------------------------------------------------------------
 // 关键参数（集中在此便于调整）
@@ -624,6 +625,360 @@ pub fn generate_beats(offset_sec: f32, period_sec: f32, duration_sec: f32) -> Ve
         t += period_sec;
     }
     beats
+}
+
+// ---------------------------------------------------------------------------
+// 拍号（meter）与小节重拍（downbeat）
+// ---------------------------------------------------------------------------
+//
+// 只用一路宽带 onset 判不出小节层次：snare 的频谱通量比底鼓大，实测 4/4 摇滚
+// 会被判成「第 3 拍最强」。所以单独算一路低频包络（底鼓基频），在拍网格上取样，
+// 得到「每拍有多重」的序列，再对它做自相关：
+//   * r(3) 明显为正 → 每 3 拍重复 → 3/4
+//   * r(3) 为负、r(2)/r(4) 为正 → 2 或 4 拍一组 → 按 4/4 处理
+// 4/4 与 2/4 在信号上等价，6/8 与 3/4 同周期，都不做区分（见 README）。
+
+/// 低频带截止频率（Hz）：底鼓基频基本落在 40~100 Hz，取 110 略有余量
+pub const LOW_BAND_HZ: f32 = 110.0;
+/// 每拍强度的取样窗：向前 / 向后（秒）
+pub const BEAT_WIN_PRE: f32 = 0.02;
+pub const BEAT_WIN_POST: f32 = 0.06;
+/// 少于这么多拍就不猜拍号（≈2 个小节）
+pub const METER_MIN_BEATS: usize = 9;
+/// 判为三拍子的门槛：r(3) 至少这么高
+pub const METER_R3_MIN: f32 = 0.15;
+/// 且 r(3) 要比 r(2)、r(4) 中较大的那个还高出这么多
+pub const METER_R3_MARGIN: f32 = 0.10;
+/// 每拍强度的相对起伏（标准差 / 均值）低于此值就不做拍号判断
+///
+/// four-on-floor 这类每拍都有底鼓的曲子，强度序列几乎是常数，剩下那 1~2% 的
+/// 细微差别全是「拍网格与帧网格」的采样相位伪影——自相关会把它放大成 0.4 以上的
+/// 假峰（实测 dance44 就是这样被误判成 3/4）。真实强弱拍的差异远大于此。
+pub const METER_MIN_VARIATION: f32 = 0.15;
+/// 相位打平时（差值小于此值）取更靠前的那个，避免 4/4 摇滚在「第 1 拍 / 第 3 拍」
+/// 两个等价候选之间来回跳
+pub const PHASE_TIE_EPS: f32 = 0.02;
+
+/// 低频（底鼓）RMS 包络，帧率与 onset 包络一致（sr / HOP）
+///
+/// 实现上边滤波边用环形缓冲维护最近一窗的平方和，不额外保存整段低通信号
+/// （长曲目能省下几十 MB）。
+pub fn low_band_envelope(samples: &[f32], sr: u32) -> Vec<f32> {
+    if samples.is_empty() || sr == 0 {
+        return Vec::new();
+    }
+    // 一阶 IIR 低通：z[n] = b*x[n] + a*z[n-1]
+    let a = (-2.0 * std::f32::consts::PI * LOW_BAND_HZ / sr as f32).exp();
+    let b = 1.0 - a;
+
+    let n_frames = samples.len() / HOP + 1;
+    let mut env = vec![0f32; n_frames];
+    let half = FRAME_LEN / 2;
+    let mut ring = vec![0f64; FRAME_LEN];
+    let mut ring_sum = 0f64;
+    let mut z = 0f32;
+
+    for (i, &s) in samples.iter().enumerate() {
+        z = b * s + a * z;
+        let sq = (z as f64) * (z as f64);
+        let slot = i % FRAME_LEN;
+        ring_sum += sq - ring[slot];
+        ring[slot] = sq;
+
+        // 居中窗 [center-half, center+half] 的样本在读到 center+half 时刚好凑齐
+        if i >= half && (i - half).is_multiple_of(HOP) {
+            let f = (i - half) / HOP;
+            if f < n_frames {
+                env[f] = (ring_sum.max(0.0) / FRAME_LEN as f64).sqrt() as f32;
+            }
+        }
+    }
+
+    let max = env.iter().cloned().fold(0f32, f32::max);
+    if max > 1e-9 {
+        for v in env.iter_mut() {
+            *v /= max;
+        }
+    }
+    env
+}
+
+/// 在拍网格上取每拍的低频强度（窗口内取最大值，容忍几十毫秒的相位抖动）
+pub fn beat_strengths(env: &[f32], fps: f32, beats: &[f32]) -> Vec<f32> {
+    if env.is_empty() || !fps.is_finite() || fps <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(beats.len());
+    for &t in beats {
+        let i0 = ((t - BEAT_WIN_PRE) * fps).floor().max(0.0) as usize;
+        let i1 = ((t + BEAT_WIN_POST) * fps).floor().max(0.0) as usize + 1;
+        let i1 = i1.min(env.len());
+        if i1 > i0 {
+            out.push(env[i0..i1].iter().cloned().fold(0f32, f32::max));
+        } else {
+            out.push(0.0);
+        }
+    }
+    out
+}
+
+/// 拍号推断结果
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeterGuess {
+    /// 每小节拍数：3 = 3/4，4 = 4/4
+    pub beats_per_bar: i32,
+    /// 第一个小节重拍相对于 `beats[0]` 的偏移（0 ~ bpb-1）
+    pub phase: usize,
+    /// 推断把握 0.0 ~ 1.0（样本不足时为 0）
+    pub confidence: f32,
+}
+
+impl Default for MeterGuess {
+    fn default() -> Self {
+        Self {
+            beats_per_bar: 4,
+            phase: 0,
+            confidence: 0.0,
+        }
+    }
+}
+
+/// 由每拍的低频强度推断拍号与重拍相位
+pub fn detect_meter(strengths: &[f32]) -> MeterGuess {
+    let mut guess = MeterGuess::default();
+    if strengths.len() < METER_MIN_BEATS {
+        return guess;
+    }
+
+    // 首拍的窗内样本不足（包络刚起步），统计时跳过，避免把相位 0 的均值压低
+    let s = &strengths[1..];
+    if relative_spread(s) < METER_MIN_VARIATION {
+        // 每拍一样重：没有任何小节内证据，按 4/4 且把握为 0
+        return guess;
+    }
+
+    let r2 = normalized_autocorr(s, 2);
+    let r3 = normalized_autocorr(s, 3);
+    let r4 = normalized_autocorr(s, 4);
+    let even = r2.max(r4);
+
+    // 三拍子的证据必须够强，才敢推翻「默认 4/4」：误报 3/4 比漏报更让人不信任
+    let is_triple = r3 >= METER_R3_MIN && r3 >= even + METER_R3_MARGIN;
+    let margin = if is_triple { r3 - even } else { even - r3 };
+
+    guess.beats_per_bar = if is_triple { 3 } else { 4 };
+    guess.confidence = ((margin - METER_R3_MARGIN) / 0.4).clamp(0.0, 1.0);
+    guess.phase = detect_downbeat_phase(strengths, guess.beats_per_bar as usize);
+    guess
+}
+
+/// 相对起伏：标准差 / 均值（变异系数）。均值为 0 时返回 0
+fn relative_spread(x: &[f32]) -> f32 {
+    let n = x.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let mean = x.iter().sum::<f32>() / n as f32;
+    if mean <= 1e-6 {
+        return 0.0;
+    }
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+    var.sqrt() / mean
+}
+
+/// 归一化自相关（去均值后按方差归一）
+fn normalized_autocorr(x: &[f32], lag: usize) -> f32 {
+    let n = x.len();
+    if lag == 0 || n <= lag + 2 {
+        return 0.0;
+    }
+    let count = n - lag;
+    let mean = x.iter().sum::<f32>() / n as f32;
+    let mut num = 0f64;
+    let mut e1 = 0f64;
+    let mut e2 = 0f64;
+    for i in 0..count {
+        let a = (x[i] - mean) as f64;
+        let b = (x[i + lag] - mean) as f64;
+        num += a * b;
+        e1 += a * a;
+        e2 += b * b;
+    }
+    let den = (e1 * e2).sqrt();
+    if den > 1e-12 {
+        (num / den) as f32
+    } else {
+        0.0
+    }
+}
+
+/// 小节重拍相位：把拍强度按 bpb 取模分组，平均最强的那一组就是重拍位置
+///
+/// 平局时取最靠前的相位（曲子通常从小节头开始）。注意 4/4 摇滚的 kick 在第 1、3 拍，
+/// 两者一样强、只能缩到两个候选；four-on-floor 舞曲每拍都有底鼓，这里没有任何信息。
+pub fn detect_downbeat_phase(strengths: &[f32], bpb: usize) -> usize {
+    let bpb = bpb.max(1);
+    if strengths.is_empty() {
+        return 0;
+    }
+    let mut best_phase = 0usize;
+    let mut best_avg = f32::NEG_INFINITY;
+    for ph in 0..bpb {
+        let mut sum = 0f32;
+        let mut count = 0usize;
+        for (i, &v) in strengths.iter().enumerate().skip(1) {
+            if (i + bpb - ph).is_multiple_of(bpb) {
+                sum += v;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        let avg = sum / count as f32;
+        // 加一点死区：接近并列时保留更靠前的相位（4/4 摇滚的 kick 在第 1、3 拍，
+        // 两者一样强，来回跳会让小节线闪）
+        if avg > best_avg + PHASE_TIE_EPS {
+            best_avg = avg;
+            best_phase = ph;
+        }
+    }
+    best_phase
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+
+    /// 每 bpb 拍一个重音的强度序列
+    fn pattern(bpb: usize, n: usize, strong: f32, weak: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| if i % bpb == 0 { strong } else { weak })
+            .collect()
+    }
+
+    #[test]
+    fn 三拍子模式被识别为三拍() {
+        let g = detect_meter(&pattern(3, 33, 1.0, 0.2));
+        assert_eq!(g.beats_per_bar, 3, "每 3 拍一个重音应判 3 拍");
+        assert_eq!(g.phase, 0);
+        assert!(g.confidence > 0.5, "置信度应偏高，实际 {}", g.confidence);
+    }
+
+    #[test]
+    fn 四拍子模式不会被误判为三拍() {
+        let g = detect_meter(&pattern(4, 33, 1.0, 0.2));
+        assert_eq!(g.beats_per_bar, 4);
+    }
+
+    #[test]
+    fn 两拍交替不会被硬凑成三拍() {
+        // 4/4 摇滚：kick 1/3、snare 2/4，实际的周期是 2 拍
+        let g = detect_meter(&pattern(2, 33, 1.0, 0.2));
+        assert_eq!(g.beats_per_bar, 4, "周期 2 拍应归到 4/4");
+    }
+
+    #[test]
+    fn 强拍不在第一拍时能找回相位() {
+        // 4 拍一组，但序列从第 3 拍开始：真正的小节头在相对索引 2
+        let base = pattern(4, 40, 1.0, 0.2);
+        let s: Vec<f32> = base.iter().cycle().skip(2).take(36).cloned().collect();
+        let g = detect_meter(&s);
+        assert_eq!(g.beats_per_bar, 4);
+        assert_eq!(g.phase, 2, "应把重拍定位到相对首拍的第 2 个位置");
+    }
+
+    #[test]
+    fn 三拍子也能找回相位() {
+        let base = pattern(3, 36, 1.0, 0.2);
+        let s: Vec<f32> = base.iter().cycle().skip(1).take(33).cloned().collect();
+        let g = detect_meter(&s);
+        assert_eq!(g.beats_per_bar, 3);
+        assert_eq!(g.phase, 2, "重音落在 idx 2、5、8…，相位应为 2");
+    }
+
+    #[test]
+    fn 样本太少时按四四拍兜底() {
+        let g = detect_meter(&pattern(3, 6, 1.0, 0.2));
+        assert_eq!(g.beats_per_bar, 4);
+        assert_eq!(g.confidence, 0.0);
+        assert_eq!(g.phase, 0);
+    }
+
+    #[test]
+    fn 平坦序列没有可信证据() {
+        // 每拍一样重（例如 four-on-floor）：不该有任何把握说它是三拍子
+        let g = detect_meter(&vec![0.8f32; 40]);
+        assert_eq!(g.beats_per_bar, 4);
+        assert!(g.confidence < 0.5, "平坦序列的把握应当很低，实际 {}", g.confidence);
+    }
+
+    #[test]
+    fn 采样伪影不会被当成三拍子() {
+        // 复现实测：每拍强度 0.78~0.81，剩下那点差别是同 3 拍的采样相位抖动。
+        // 不做起伏门槛时 r(3) 会被放大到 0.42，误判成 3/4
+        let s: Vec<f32> = (0..40)
+            .map(|i| 0.79 + if i % 3 == 0 { 0.015 } else { 0.0 })
+            .collect();
+        let g = detect_meter(&s);
+        assert_eq!(g.beats_per_bar, 4, "2% 的起伏不足以判三拍子");
+        assert!(g.confidence < 0.1, "把握应为 0，实际 {}", g.confidence);
+    }
+
+    #[test]
+    fn 相位近乎并列时取更靠前的() {
+        // kick 在第 0、2 拍，第 2 拍因叠了踩镲略强一点点
+        let s: Vec<f32> = (0..40)
+            .map(|i| match i % 4 {
+                0 => 0.80,
+                2 => 0.805,
+                _ => 0.10,
+            })
+            .collect();
+        assert_eq!(
+            detect_downbeat_phase(&s, 4),
+            0,
+            "0.005 的差距不该把相位推到后一个候选"
+        );
+    }
+
+    #[test]
+    fn 相位差异明显时选更强的() {
+        let s: Vec<f32> = (0..40)
+            .map(|i| match i % 4 {
+                0 => 0.20,
+                1 => 0.90,
+                _ => 0.10,
+            })
+            .collect();
+        assert_eq!(detect_downbeat_phase(&s, 4), 1);
+    }
+
+    #[test]
+    fn 低频包络只跟随底鼓() {
+        // 8 kHz 下放两个 60 Hz 衰减脉冲（0.1s / 0.6s），中间留空
+        let sr = 8000u32;
+        let n = sr as usize;
+        let mut buf = vec![0f32; n];
+        for &t0 in &[0.1f32, 0.6] {
+            let i0 = (t0 * sr as f32) as usize;
+            for k in 0..(0.12 * sr as f32) as usize {
+                if i0 + k < n {
+                    let tt = k as f32 / sr as f32;
+                    buf[i0 + k] += (-tt * 40.0).exp() * (2.0 * std::f32::consts::PI * 60.0 * tt).sin();
+                }
+            }
+        }
+        let env = low_band_envelope(&buf, sr);
+        let fps = sr as f32 / HOP as f32;
+        let at = |t: f32| env[((t * fps) as usize).min(env.len() - 1)];
+        assert!(
+            at(0.1) > at(0.35) * 3.0,
+            "底鼓处应明显高于间隙：{} vs {}",
+            at(0.1),
+            at(0.35)
+        );
+    }
 }
 
 #[cfg(test)]

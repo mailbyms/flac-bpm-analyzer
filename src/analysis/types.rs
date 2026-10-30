@@ -34,10 +34,87 @@ pub struct AnalysisResult {
     pub channels: u16,
     /// 用于绘制波形的归一化峰值数组（0.0 ~ 1.0，长度固定）
     pub waveform_peaks: Vec<f32>,
-    /// 每小节拍数（当前固定 4/4）
-    // 只被 CSV 导出（gui feature）读取；纯命令行构建里没人用，别为它报警告
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    /// 每小节拍数：3 = 3/4，4 = 4/4，2 = 2/4
     pub beats_per_bar: i32,
+    /// 第一个小节重拍的位置：`beats[downbeat_phase]` 是第一个强拍，之后每 `beats_per_bar` 拍一个
+    pub downbeat_phase: usize,
+    /// 拍号推断的把握 0.0 ~ 1.0（0 表示样本太少、没做推断）
+    pub meter_confidence: f32,
+}
+
+impl AnalysisResult {
+    /// 每小节拍数（至少 1，防止脏数据导致除零）
+    pub fn bpb(&self) -> usize {
+        self.beats_per_bar.max(1) as usize
+    }
+
+    /// 第 `idx` 拍是否是小节重拍
+    pub fn is_downbeat(&self, idx: usize) -> bool {
+        let bpb = self.bpb();
+        (idx + bpb - self.downbeat_phase % bpb).is_multiple_of(bpb)
+    }
+
+    /// 第 `idx` 拍的小节位置：返回 (小节号, 小节内第几拍)，均为 1 起。
+    ///
+    /// 第一个重拍之前不足一小节的部分算「第 0 小节」，调用方可以显示成「前导」。
+    pub fn bar_position(&self, idx: usize) -> (i64, usize) {
+        bar_position_of(idx, self.bpb(), self.downbeat_phase)
+    }
+
+    /// 拍号的显示文本，例如 `4 / 4`
+    pub fn meter_label(&self) -> String {
+        format!("{} / 4", self.bpb())
+    }
+}
+
+/// 纯函数版的小节位置计算（便于直接测边界）
+///
+/// `phase` 是第一个小节重拍的索引。注意不能用 `idx % bpb` 硬算：
+/// 重拍不在第 0 拍时，小节头会整体错位。
+pub fn bar_position_of(idx: usize, bpb: usize, phase: usize) -> (i64, usize) {
+    let bpb = bpb.max(1);
+    let phase = (phase % bpb) as i64;
+    let rel = idx as i64 - phase;
+    let bar = rel.div_euclid(bpb as i64);
+    let beat = rel.rem_euclid(bpb as i64) as usize;
+    (bar + 1, beat + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 重拍在第一拍时按四拍分小节() {
+        assert_eq!(bar_position_of(0, 4, 0), (1, 1));
+        assert_eq!(bar_position_of(3, 4, 0), (1, 4));
+        assert_eq!(bar_position_of(4, 4, 0), (2, 1));
+        assert_eq!(bar_position_of(7, 4, 0), (2, 4));
+    }
+
+    #[test]
+    fn 重拍错开时小节头跟着后移() {
+        // 首个重拍在第 3 个位置：idx 0、1 属于「第 0 小节」的尾巴
+        assert_eq!(bar_position_of(0, 4, 2), (0, 3));
+        assert_eq!(bar_position_of(1, 4, 2), (0, 4));
+        assert_eq!(bar_position_of(2, 4, 2), (1, 1));
+        assert_eq!(bar_position_of(5, 4, 2), (1, 4));
+        assert_eq!(bar_position_of(6, 4, 2), (2, 1));
+    }
+
+    #[test]
+    fn 三拍子的小节划分() {
+        assert_eq!(bar_position_of(1, 3, 1), (1, 1));
+        assert_eq!(bar_position_of(3, 3, 1), (1, 3));
+        assert_eq!(bar_position_of(4, 3, 1), (2, 1));
+        assert_eq!(bar_position_of(0, 3, 1), (0, 3));
+    }
+
+    #[test]
+    fn 脏数据不会除零() {
+        // bpb = 0 应被夹到 1，phase 取模后落在合法范围
+        assert_eq!(bar_position_of(5, 0, 7), (6, 1));
+    }
 }
 
 /// 后台线程向 UI 发送的事件

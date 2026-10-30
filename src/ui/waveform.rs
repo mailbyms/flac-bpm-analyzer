@@ -737,18 +737,19 @@ fn draw_beat_tooltip(
     t: f32,
     result: &AnalysisResult,
 ) {
-    let bpb = result.beats_per_bar.max(1) as usize;
     let g_num = painter.layout_no_wrap(
         format!("节拍 #{}", idx + 1),
         FontId::proportional(12.0),
         TEXT_SUB,
     );
     let g_time = painter.layout_no_wrap(format_timecode(t), FontId::monospace(16.0), BEAT);
-    let g_bar = painter.layout_no_wrap(
-        format!("第 {} 小节 · 第 {} 拍", idx / bpb + 1, idx % bpb + 1),
-        FontId::proportional(11.0),
-        TEXT_SUB,
-    );
+    let (bar, beat) = result.bar_position(idx);
+    let bar_text = if bar <= 0 {
+        format!("前导 · 第 {beat} 拍")
+    } else {
+        format!("第 {bar} 小节 · 第 {beat} 拍")
+    };
+    let g_bar = painter.layout_no_wrap(bar_text, FontId::proportional(11.0), TEXT_SUB);
     draw_tooltip_box(
         painter,
         rect,
@@ -1012,9 +1013,16 @@ fn draw_beat_layer(
 
     let px_per_sec = rect.width() / (duration / view.zoom).max(1e-6);
     let px_per_beat = px_per_sec * period;
+    let bpb = result.bpb();
 
-    // 抽稀策略：间距不足时只画 n 的倍数拍
-    let stride = beat_stride(px_per_beat);
+    // 抽稀策略：间距不足时只画 n 的倍数拍。
+    // 但 stride 必须对齐小节：3/4 曲子里按 4 拍抽稀会让画出来的线和小节头错位，
+    // 而且被抽掉的恰好是重拍。
+    let stride = match beat_stride(px_per_beat) {
+        1 => 1,
+        s => bpb * (s / bpb).max(1),
+    };
+    let phase = result.downbeat_phase % bpb;
 
     let first_idx = ((t0 - result.first_beat_offset) / period).floor() as i64 - 1;
     let mut idx = first_idx;
@@ -1027,8 +1035,9 @@ fn draw_beat_layer(
             if t >= t0 {
                 // 对齐物理像素：细线在亚像素位置滚动时会忽明忽暗
                 let x = snap_x(view.time_to_x(t, rect, duration), ppp);
-                if (idx as usize) % stride == 0 {
-                    let is_downbeat = (idx as usize) % result.beats_per_bar.max(1) as usize == 0;
+                // 从重拍开始按 stride 递推，保证小节线一定落在网格上
+                if (idx as usize + bpb - phase).is_multiple_of(stride) {
+                    let is_downbeat = result.is_downbeat(idx as usize);
                     let hi = hover == Some(idx as usize);
                     let (line_color, handle_color) = if is_downbeat {
                         (DOWNBEAT, DOWNBEAT)
@@ -1353,6 +1362,8 @@ mod tests {
             channels: 2,
             waveform_peaks: vec![0.5; 4096],
             beats_per_bar: 4,
+            downbeat_phase: 0,
+            meter_confidence: 0.8,
         }
     }
 

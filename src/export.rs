@@ -40,11 +40,10 @@ fn write_csv(path: &std::path::Path, result: &AnalysisResult) -> Result<(), Stri
     )
     .map_err(|e| format!("写入失败：{e}"))?;
 
-    let per_bar = result.beats_per_bar.max(1);
     for (i, &t) in result.beats.iter().enumerate() {
-        let bar = i as i32 / per_bar + 1;
-        let beat_in_bar = i as i32 % per_bar + 1;
-        let is_downbeat = if beat_in_bar == 1 { 1 } else { 0 };
+        // 小节号与小节内位置要跟着重拍相位走，不能拿「第 0 拍就是小节头」硬算
+        let (bar, beat_in_bar) = result.bar_position(i);
+        let is_downbeat = if result.is_downbeat(i) { 1 } else { 0 };
         writeln!(
             file,
             "{},{:.6},{},{},{},{},{:.2},{:.1}",
