@@ -1,6 +1,6 @@
 [package]
 name = "flac-bpm-analyzer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # 最低支持的 Rust 版本（MSRV）。低于此版本编译会给出明确报错，而不是一堆语法/库 API 错误。
 rust-version = "1.88"

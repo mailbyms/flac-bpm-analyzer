@@ -10,10 +10,15 @@ Windows 桌面 GUI 工具：导入单个 **FLAC 或 MP3** 文件 → 自动分�
 
 ## 下载（免编译）
 
-不装 Rust 也能用：到 [Releases](https://github.com/mailbyms/flac-bpm-analyzer/releases) 下载
-`flac-bpm-analyzer-v0.2.0-windows-x64.exe`，双击运行即可。
+不装 Rust 也能用：到 [Releases](https://github.com/mailbyms/flac-bpm-analyzer/releases) 下载，
+都是单文件、无需安装：
 
-- 单文件、无需安装；已静态链接 C++ 运行时，不需要额外装 VC++ Redistributable
+| 附件 | 用途 |
+| --- | --- |
+| `flac-bpm-analyzer-v0.3.0-windows-x64.exe` | 桌面版，双击运行（波形界面 + 播放） |
+| `flac-bpm-analyzer-v0.3.0-cli-windows-x64.exe` | 命令行版，`--analyze` 批量分析，不弹窗 |
+
+- 已静态链接 C++ 运行时，不需要额外装 VC++ Redistributable
 - 系统要求：Windows 10 / 11（x64）
 - 未做代码签名，首次运行若提示「未知发布者」，点「更多信息 → 仍要运行」
 

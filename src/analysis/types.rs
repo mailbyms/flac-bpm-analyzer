@@ -49,6 +49,8 @@ impl AnalysisResult {
     }
 
     /// 第 `idx` 拍是否是小节重拍
+    // 只有界面（波形小节线 / CSV 导出）读这两个方法，纯命令行构建里没人调
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn is_downbeat(&self, idx: usize) -> bool {
         let bpb = self.bpb();
         (idx + bpb - self.downbeat_phase % bpb).is_multiple_of(bpb)
@@ -57,6 +59,7 @@ impl AnalysisResult {
     /// 第 `idx` 拍的小节位置：返回 (小节号, 小节内第几拍)，均为 1 起。
     ///
     /// 第一个重拍之前不足一小节的部分算「第 0 小节」，调用方可以显示成「前导」。
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn bar_position(&self, idx: usize) -> (i64, usize) {
         bar_position_of(idx, self.bpb(), self.downbeat_phase)
     }
@@ -71,6 +74,7 @@ impl AnalysisResult {
 ///
 /// `phase` 是第一个小节重拍的索引。注意不能用 `idx % bpb` 硬算：
 /// 重拍不在第 0 拍时，小节头会整体错位。
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn bar_position_of(idx: usize, bpb: usize, phase: usize) -> (i64, usize) {
     let bpb = bpb.max(1);
     let phase = (phase % bpb) as i64;
